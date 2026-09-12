@@ -40,6 +40,9 @@ Edit SHAKING_MAGNITUDE_THRESHOLD and TARGET_LOCATIONS below to configure.
 """
 
 import json
+import sqlite3
+import smtplib
+from email.mime.text import MIMEText
 import math
 import time
 import threading
@@ -58,6 +61,11 @@ import matplotlib.pyplot as plt
 import matplotlib.colors
 import matplotlib.ticker
 import os
+
+# All configurable parameters live in config.py -- import early, before
+# any module-load-time code below (e.g. the hazardlib pre-loading block)
+# needs them.
+from config import *
 
 # Import hazardlib ONCE at module load time, on the main thread, before any
 # background threads start. Importing it lazily inside a function that can
@@ -107,62 +115,18 @@ def _get_gmpe_instance(module_path, class_name):
         return None
 
 
-# (region_name, minlat, maxlat, minlon, maxlon, tectonic_type,
-#  module_path, class_name, caution_note)
-# Checked in order; first bounding-box match wins. Longitude ranges that
-# cross the antimeridian (e.g. the Pacific) are split into two entries.
-_REGION_GMPE_TABLE = [
-    ("Middle East / Mediterranean", 25, 45, 20, 50,
-     "Active Shallow Crust",
-     "openquake.hazardlib.gsim.akkar_2014", "AkkarEtAlRjb2014", None),
-
-    ("Western North America (California-like)", 30, 50, -125, -110,
-     "Active Shallow Crust (California-calibrated)",
-     "openquake.hazardlib.gsim.boore_2014", "BooreEtAl2014", None),
-
-    ("Hawaii", 18, 23, -161, -154,
-     "Volcanic",
-     "openquake.hazardlib.gsim.boore_2014", "BooreEtAl2014",
-     "Volcanic/flank earthquakes are NOT well represented by standard "
-     "tectonic GMPEs -- this is a rough crustal-model proxy, treat "
-     "with extra caution"),
-
-    ("Alaska / Aleutians (subduction)", 50, 72, -180, -130,
-     "Subduction Interface",
-     "openquake.hazardlib.gsim.zhao_2006", "ZhaoEtAl2006SInter", None),
-
-    ("Tonga / Kermadec (subduction)", -30, -14, -180, -170,
-     "Subduction Interface",
-     "openquake.hazardlib.gsim.zhao_2006", "ZhaoEtAl2006SInter", None),
-
-    ("Japan (subduction)", 24, 46, 122, 148,
-     "Subduction Interface",
-     "openquake.hazardlib.gsim.zhao_2006", "ZhaoEtAl2006SInter", None),
-
-    ("Indonesia (subduction)", -11, 6, 95, 141,
-     "Subduction Interface",
-     "openquake.hazardlib.gsim.zhao_2006", "ZhaoEtAl2006SInter", None),
-
-    ("Central/Eastern US (stable continental)", 25, 50, -105, -65,
-     "Stable Continental",
-     "openquake.hazardlib.gsim.atkinson_boore_2006", "AtkinsonBoore2006", None),
-]
-
-_DEFAULT_REGION = ("Unclassified (default fallback)", "Active Shallow Crust "
-                  "(generic default)", "openquake.hazardlib.gsim.akkar_2014",
-                  "AkkarEtAlRjb2014",
-                  "Event location didn't match any known region -- using "
-                  "a generic default model. Treat with extra caution.")
+# REGION_GMPE_TABLE and DEFAULT_REGION now live in config.py (imported below)
 
 
 def select_gmpe_for_location(lat, lon):
     """
     Return (region_name, tectonic_type, gmpe_instance, gmpe_name,
     caution_note_or_None) for the given location, based on
-    _REGION_GMPE_TABLE. Falls back to _DEFAULT_REGION if nothing matches.
+    REGION_GMPE_TABLE (from config.py). Falls back to DEFAULT_REGION
+    if nothing matches.
     """
     for (name, minlat, maxlat, minlon, maxlon, tectonic_type,
-        module_path, class_name, note) in _REGION_GMPE_TABLE:
+        module_path, class_name, note) in REGION_GMPE_TABLE:
         if minlat <= lat <= maxlat and minlon <= lon <= maxlon:
             instance = _get_gmpe_instance(module_path, class_name)
             if instance is not None:
@@ -170,7 +134,7 @@ def select_gmpe_for_location(lat, lon):
 
     # Fallback: default region, or a matched region whose GMPE class
     # failed to load
-    name, tectonic_type, module_path, class_name, note = _DEFAULT_REGION
+    name, tectonic_type, module_path, class_name, note = DEFAULT_REGION
     instance = _get_gmpe_instance(module_path, class_name)
     return name, tectonic_type, instance, class_name, note
 
@@ -185,91 +149,17 @@ try:
     # also always from the main thread (event detection loop), not from
     # the EMSC websocket thread.
     _DEFAULT_GMPE_INSTANCE = _get_gmpe_instance(
-        _DEFAULT_REGION[2], _DEFAULT_REGION[3])
+        DEFAULT_REGION[2], DEFAULT_REGION[3])
     _HAZARDLIB_OK = _DEFAULT_GMPE_INSTANCE is not None
 except ImportError:
     _HAZARDLIB_OK = False
     _GMPE_NAME = "unknown"
 
 # --------------------------------------------------------------------------
-# CONFIGURATION
+# CONFIGURATION -- all values live in config.py (imported at the top of
+# this file). Edit config.py, not this file, to change any parameter.
 # --------------------------------------------------------------------------
 
-EMSC_WS_URL = "wss://www.seismicportal.eu/standing_order/websocket"
-USGS_FEED_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson"
-USGS_POLL_INTERVAL_SEC = 60
-
-MIN_MAGNITUDE = 0.0      # minimum magnitude to even track/report at all
-BBOX = None                # None = global. Or (minlat, maxlat, minlon, maxlon)
-
-# Deduplication thresholds (same event reported by both EMSC and USGS)
-DEDUP_TIME_SEC = 90
-DEDUP_DIST_DEG = 1.0
-DEDUP_MAG_DELTA = 1.0
-
-# Only run the (heavier) shaking computation for events at or above this
-# magnitude -- avoids wasting time computing shaking estimates for tiny,
-# clearly-inconsequential events.
-SHAKING_MAGNITUDE_THRESHOLD = 5.0
-
-# Locations to estimate shaking at, whenever a qualifying event occurs.
-# (name, lat, lon)
-TARGET_LOCATIONS = [
-    ("Tel Aviv", 32.0853, 34.7818),
-    ("Jerusalem", 31.7683, 35.2137),
-    ("Los Angeles", 34.0522, -118.2437),
-    ("Athens", 37.9838, 23.7275),
-    ("Nuku'alofa, Tonga", -21.1394, -175.2049),
-    ("Hilo, Hawaii", 19.7297, -155.0900),  # near frequent Big Island seismicity
-]
-
-# BSSA14 (like most GMPEs) is empirically calibrated from real recordings
-# typically only out to a few hundred km. Beyond this range you're not
-# just getting "very small" numbers -- you're extrapolating the model
-# far outside where it was ever validated, and the physical mechanism
-# of any distant shaking (long-period surface waves) isn't what these
-# near-field body-wave models represent anyway. Skip the computation
-# entirely beyond this distance rather than showing misleading precision
-# on a physically meaningless number.
-MAX_VALID_DISTANCE_KM = 300
-
-# Shake map color scale. By default, each map auto-scales its color range
-# to that event's own min/max PGA -- which means a tiny M2 event and a
-# large M6.5 event will use completely different scales (as you likely
-# noticed comparing two test maps), making them NOT visually comparable
-# to each other. Set SHAKEMAP_VMAX to a fixed number (in %g) to force
-# every map to use the same scale instead, so events become visually
-# comparable to one another. Leave as None to keep auto-scaling
-# (best per-event detail, but not comparable across events).
-SHAKEMAP_VMAX = None  # e.g. 30.0 for a fixed 0-30%g scale on every map
-
-# PGA can span orders of magnitude between small and large events. A
-# logarithmic color scale shows meaningful detail across that whole
-# range in one map, instead of a linear scale where small events look
-# almost entirely blank. Only affects the color mapping, not the
-# underlying computed values.
-SHAKEMAP_LOG_SCALE = False
-
-# Use contextily to draw real web-map basemap tiles (streets, terrain, or
-# satellite imagery) underneath the shake contours, instead of just bare
-# coastline outlines. Requires internet access at runtime (fetches map
-# tiles live) and `pip install contextily`. Falls back to the geopandas
-# coastline layer if contextily isn't installed or a tile fetch fails.
-SHAKEMAP_USE_CONTEXTILY = True
-# Pick a tile provider. Both OpenStreetMap (strict automated-usage policy)
-# and CartoDB (now requires an API key) have proven unreliable for this
-# kind of use. Esri's public basemap tiles work without any API key.
-# "WorldStreetMap" shows the actual road network clearly (unlike
-# WorldTopoMap, which is terrain/elevation-focused and de-emphasizes
-# roads). Other options: "Esri.WorldImagery" (satellite photo).
-SHAKEMAP_CONTEXTILY_PROVIDER = "Esri.WorldStreetMap"
-
-# Span (in degrees lat/lon) for the two additional zoomed outputs.
-# Regional map span is calculated automatically from MAX_VALID_DISTANCE_KM.
-STREET_MAP_SPAN_DEG = 0.5     # ~55km -- metro-area street-level view
-ZOOM_STREET_MAP_SPAN_DEG = 0.03  # ~3.3km -- close-up, building/street scale
-
-DEFAULT_VS30 = 400.0  # fallback ONLY if the real USGS lookup fails
 
 # Cache so we don't re-query the same location's Vs30 on every event
 _vs30_cache = {}
@@ -348,6 +238,172 @@ def lookup_vs30(lat, lon):
         return DEFAULT_VS30
 
 # --------------------------------------------------------------------------
+
+# ============================================================================
+# Notifications (email + optional webhook)
+# ============================================================================
+
+def notify_email(subject, body):
+    """Send an email notification via standard SMTP. Works with Gmail,
+    Outlook, or any SMTP provider -- no extra dependency, uses Python's
+    built-in smtplib. Does nothing if NOTIFY_EMAIL is False or the
+    required settings aren't filled in."""
+    if not NOTIFY_EMAIL:
+        return
+    if not (SMTP_USERNAME and SMTP_PASSWORD and EMAIL_FROM and EMAIL_TO):
+        print("  [notify] NOTIFY_EMAIL is True but SMTP settings aren't "
+              "fully filled in -- skipping email. Check SMTP_USERNAME, "
+              "SMTP_PASSWORD, EMAIL_FROM, EMAIL_TO in the config section.")
+        return
+
+    try:
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_FROM
+        msg["To"] = EMAIL_TO
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+    except Exception as e:
+        print(f"  [notify] Email notification failed: {type(e).__name__}: {e}")
+        if "gmail" in SMTP_HOST.lower() and "Username and Password not accepted" in str(e):
+            print("  [notify] Hint: Gmail requires an App Password, not "
+                  "your normal account password -- see the comment above "
+                  "SMTP_HOST in the config section.")
+
+
+def notify_webhook(message):
+    """Send a message to a Slack or Discord webhook, if WEBHOOK_URL is
+    configured. Does nothing if WEBHOOK_URL is None."""
+    if not WEBHOOK_URL:
+        return
+    try:
+        if WEBHOOK_TYPE == "discord":
+            payload = {"content": message}
+        else:  # default: slack
+            payload = {"text": message}
+        resp = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  [notify] Webhook failed: {type(e).__name__}: {e}")
+
+
+def send_event_notifications(event):
+    """Send email + webhook notifications for a newly detected event,
+    if it meets NOTIFY_MAGNITUDE_THRESHOLD."""
+    mag = event.get("mag")
+    if mag is None or mag < NOTIFY_MAGNITUDE_THRESHOLD:
+        return
+
+    dt = datetime.fromtimestamp(event["time"], tz=timezone.utc).isoformat()
+    subject = f"Earthquake Alert: M{mag} - {event['place']}"
+    body = (f"Magnitude: M{mag}\n"
+           f"Location: {event['place']}\n"
+           f"Coordinates: {event['lat']:.4f}, {event['lon']:.4f}\n"
+           f"Depth: {event.get('depth')} km\n"
+           f"Time (UTC): {dt}\n\n"
+           f"This is an automated alert from your earthquake monitor. "
+           f"This reports an earthquake that has already occurred -- "
+           f"it does not predict earthquakes before they happen.")
+    notify_email(subject, body)
+
+    webhook_message = f"ð *M{mag}* â {event['place']}"
+    notify_webhook(webhook_message)
+
+
+# ============================================================================
+# Event history (SQLite)
+# ============================================================================
+
+def init_history_db():
+    """Create the event history database/tables if they don't already
+    exist. Safe to call every startup -- CREATE TABLE IF NOT EXISTS."""
+    conn = sqlite3.connect(HISTORY_DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_time REAL,
+            lat REAL,
+            lon REAL,
+            mag REAL,
+            depth REAL,
+            place TEXT,
+            sources TEXT,
+            region_name TEXT,
+            tectonic_type TEXT,
+            gmpe_name TEXT,
+            caution_note TEXT,
+            detected_at REAL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS shaking_estimates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER,
+            target_name TEXT,
+            distance_km REAL,
+            vs30 REAL,
+            pga_percent_g REAL,
+            mmi TEXT,
+            mmi_description TEXT,
+            FOREIGN KEY(event_id) REFERENCES events(id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def log_event_to_db(event, sources):
+    """Log a newly detected event to the history database. Returns the
+    new row's id (for linking shaking estimates), or None on failure."""
+    try:
+        conn = sqlite3.connect(HISTORY_DB_PATH)
+        cursor = conn.execute("""
+            INSERT INTO events (event_time, lat, lon, mag, depth, place,
+                               sources, detected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (event["time"], event["lat"], event["lon"], event["mag"],
+             event.get("depth"), event["place"], ",".join(sorted(sources)),
+             time.time()))
+        event_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return event_id
+    except Exception as e:
+        print(f"  [history] Failed to log event: {type(e).__name__}: {e}")
+        return None
+
+
+def log_shaking_estimate_to_db(event_id, region_name, tectonic_type,
+                              gmpe_name, caution_note, results):
+    """Update an event's region/GMPE info and log per-target shaking
+    results to the history database."""
+    if event_id is None:
+        return
+    try:
+        conn = sqlite3.connect(HISTORY_DB_PATH)
+        conn.execute("""
+            UPDATE events SET region_name=?, tectonic_type=?, gmpe_name=?,
+                             caution_note=?
+            WHERE id=?
+        """, (region_name, tectonic_type, gmpe_name, caution_note, event_id))
+
+        for name, dist, vs30, pga in results:
+            mmi, desc = pga_to_mmi_description(pga)
+            conn.execute("""
+                INSERT INTO shaking_estimates
+                    (event_id, target_name, distance_km, vs30,
+                    pga_percent_g, mmi, mmi_description)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (event_id, name, dist, vs30, pga, mmi, desc))
+
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"  [history] Failed to log shaking estimate: {type(e).__name__}: {e}")
+
 
 _lock = threading.Lock()
 _known_events = []  # list of dicts: {time, lat, lon, mag, depth, place, sources:set()}
@@ -474,7 +530,7 @@ def compute_shaking_at_targets(magnitude, depth_km, event_lat, event_lon):
     return results, out_of_range, region_info
 
 
-SHAKEMAP_OUTPUT_DIR = "shakemaps"
+# SHAKEMAP_OUTPUT_DIR now comes from config.py (imported earlier)
 
 _world_boundaries_cache = None
 _world_boundaries_load_attempted = False
@@ -812,6 +868,9 @@ def print_shaking_estimate(event):
               f"(beyond {MAX_VALID_DISTANCE_KM}km -- outside {gmpe_name}'s "
               f"valid range, skipped)")
 
+    log_shaking_estimate_to_db(event.get("_db_id"), region_name,
+                              tectonic_type, gmpe_name, caution_note, results)
+
     try:
         map_paths = generate_all_shakemaps(event, results, out_of_range)
         for label, path in map_paths.items():
@@ -865,6 +924,9 @@ def report_event(source, t, lat, lon, mag, depth, place):
     print(f"      M{mag}  {place}")
     print(f"      Time: {dt.isoformat()}")
     print(f"      Location: {lat:.4f}, {lon:.4f}  Depth: {depth} km\n")
+
+    send_event_notifications(event)
+    event["_db_id"] = log_event_to_db(event, {source})
 
     if mag is not None and mag >= SHAKING_MAGNITUDE_THRESHOLD:
         print_shaking_estimate(event)
@@ -985,9 +1047,45 @@ def run_test_map(lat=19.5, lon=-155.3, mag=6.5, depth=10.0,
     print(f"Generating a TEST shake map with a synthetic M{mag} event "
           f"at ({lat}, {lon}).")
     print("This event is NOT real -- purely to verify the map pipeline "
-          "(coastlines, contours, target markers) end-to-end.\n")
+          "(coastlines, contours, target markers) AND notifications "
+          "(email/webhook) end-to-end.\n")
 
+    send_event_notifications(test_event)
     print_shaking_estimate(test_event)
+
+
+def print_history_summary():
+    """Print a quick summary of events logged in the history database:
+    total count, most recent events, and highest-magnitude events."""
+    if not os.path.exists(HISTORY_DB_PATH):
+        print(f"No history database found at '{HISTORY_DB_PATH}' -- "
+              f"run the monitor at least once first.")
+        return
+
+    conn = sqlite3.connect(HISTORY_DB_PATH)
+    total = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    print(f"Total events logged: {total}\n")
+
+    print("Most recent 10 events:")
+    rows = conn.execute("""
+        SELECT event_time, mag, place, region_name, gmpe_name
+        FROM events ORDER BY event_time DESC LIMIT 10
+    """).fetchall()
+    for event_time, mag, place, region_name, gmpe_name in rows:
+        dt = datetime.fromtimestamp(event_time, tz=timezone.utc).isoformat()
+        region_str = f" [{region_name}, {gmpe_name}]" if region_name else ""
+        print(f"  M{mag}  {place}  ({dt}){region_str}")
+
+    print("\nHighest-magnitude 10 events logged:")
+    rows = conn.execute("""
+        SELECT event_time, mag, place FROM events
+        ORDER BY mag DESC LIMIT 10
+    """).fetchall()
+    for event_time, mag, place in rows:
+        dt = datetime.fromtimestamp(event_time, tz=timezone.utc).isoformat()
+        print(f"  M{mag}  {place}  ({dt})")
+
+    conn.close()
 
 
 def main():
@@ -1014,7 +1112,15 @@ def main():
                         help="Test event magnitude (default 6.5)")
     parser.add_argument("--test-depth", type=float, default=10.0,
                         help="Test event depth in km (default 10)")
+    parser.add_argument("--history-summary", action="store_true",
+                        help="Print a quick summary of events logged so "
+                             "far in the history database, then exit "
+                             "(doesn't run the monitor).")
     args = parser.parse_args()
+
+    if args.history_summary:
+        print_history_summary()
+        return
 
     if args.test_map:
         presets = {
@@ -1030,6 +1136,9 @@ def main():
         run_test_map(lat=lat, lon=lon, mag=args.test_mag,
                     depth=args.test_depth, place=preset_place)
         return
+
+    init_history_db()
+    print(f"Event history database: {HISTORY_DB_PATH}\n")
 
     print("Starting combined earthquake monitor + shaking estimator")
     print(f"Min magnitude tracked: {MIN_MAGNITUDE}")
@@ -1060,3 +1169,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

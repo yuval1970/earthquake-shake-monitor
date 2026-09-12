@@ -82,6 +82,8 @@ def compute_ground_motion(magnitude, depth_km, distances_km, vs30, rake=0.0, dip
     try:
         from openquake.hazardlib.gsim.boore_2014 import BooreEtAl2014
         from openquake.hazardlib.imt import PGA
+        from openquake.hazardlib.const import StdDev
+        from openquake.hazardlib.contexts import RuptureContext
     except ImportError as e:
         raise ImportError(
             "openquake.hazardlib not installed or import path differs "
@@ -92,32 +94,25 @@ def compute_ground_motion(magnitude, depth_km, distances_km, vs30, rake=0.0, dip
     gmpe = BooreEtAl2014()
     n = len(distances_km)
 
-    # Build a recarray context with exactly the fields this GSIM declares
-    # it needs (gmpe.REQUIRES_SITES_PARAMETERS / _RUPTURE_PARAMETERS /
-    # _DISTANCES), then call compute() directly. This is the current
-    # (post get_mean_and_stddevs) hazardlib GMPE calling convention: no
-    # more separate SitesContext/RuptureContext/DistancesContext objects
-    # or a get_mean_and_stddevs() method -- GMPE.compute(ctx, imts, mean,
-    # sig, tau, phi) fills the output arrays in place.
-    dtype = [("mag", float), ("rake", float), ("vs30", float),
-             ("rjb", float), ("sids", int)]
-    ctx = np.recarray(n, dtype=dtype)
+    # Build a unified rupture/site/distance context. This is the modern
+    # hazardlib pattern (a single object carrying all needed arrays).
+    # If your installed version predates this, see the API NOTE above.
+    ctx = RuptureContext()
     ctx.mag = magnitude
     ctx.rake = rake
-    ctx.vs30 = np.full(n, vs30, dtype=float)
+    ctx.dip = dip
+    ctx.ztor = depth_km  # depth to top of rupture (simplified)
     ctx.rjb = np.array(distances_km, dtype=float)
-    ctx.sids = np.arange(n)
+    ctx.rrup = np.array(distances_km, dtype=float)  # simplified: rrup~=rjb for this illustration
+    ctx.vs30 = np.full(n, vs30, dtype=float)
+    ctx.vs30measured = np.full(n, True)
+    ctx.z1pt0 = np.full(n, -999.0)  # let GMPE use its default depth-to-1km/s estimate
 
-    imts = [PGA()]
-    mean = np.zeros((len(imts), n))
-    sig = np.zeros((len(imts), n))
-    tau = np.zeros((len(imts), n))
-    phi = np.zeros((len(imts), n))
-
-    gmpe.compute(ctx, imts, mean, sig, tau, phi)
-
+    mean, sig, tau, phi = gmpe.get_mean_and_stddevs(
+        ctx, ctx, ctx, PGA(), [StdDev.TOTAL]
+    )
     # hazardlib GMPEs return ln(PGA) in g; convert to g then %g
-    pga_g = np.exp(mean[0])
+    pga_g = np.exp(mean)
     pga_percent_g = pga_g * 100
 
     return {
