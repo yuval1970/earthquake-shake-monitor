@@ -116,7 +116,7 @@ brew install miniconda        # if not already installed
 conda init zsh                # or bash; restart terminal after
 conda create -n openquake_conda python=3.12
 conda activate openquake_conda
-conda install -c conda-forge openquake.engine websocket-client requests contextily geodatasets flask
+conda install -c conda-forge openquake.engine websocket-client requests contextily geodatasets flask folium
 ```
 
 Run the monitor:
@@ -417,7 +417,8 @@ own configurable constants near the top of each file, worth knowing about:
 ## Other scripts in this project (exploratory / earlier stages)
 
 **Core files** (required to run the main pipeline): `config.py`,
-`earthquake_monitor_with_shaking.py`, `dashboard.py`, `Dockerfile`.
+`earthquake_monitor_with_shaking.py`, `dashboard.py`, `Dockerfile`,
+`docker-compose.yml`.
 
 **Everything below** was built along the way and remains useful for other
 purposes, though it's not part of the final combined pipeline:
@@ -503,9 +504,10 @@ debugging process again, on this machine or any other.
 
 ### What to send someone
 
-Required files (everything the Dockerfile references):
+Required files (everything the Dockerfile and docker-compose.yml reference):
 ```
 Dockerfile
+docker-compose.yml
 config.py
 earthquake_monitor_with_shaking.py
 dashboard.py
@@ -602,6 +604,45 @@ Then open `http://localhost:5001`. This can run at the same time as the
 live monitor (step 6) in a separate terminal -- they share the same
 mounted files, one writes, the other only reads.
 
+### Easier alternative: Docker Compose (one command, both containers)
+
+Steps 6 and 7 above run as two separate `docker run` commands in two
+terminals. `docker-compose.yml` (included) starts both together with a
+single command instead, using the same shared mounted files:
+
+```bash
+touch earthquake_history.db   # once, if it doesn't already exist
+docker compose build
+docker compose up
+```
+
+Logs from both containers interleave in one terminal (prefixed
+`earthquake-monitor` / `earthquake-dashboard`). Dashboard still opens at
+`http://localhost:5001`. Configuration still comes from `.env` in the
+same folder -- Compose reads it automatically, no `--env-file` flag needed.
+
+```bash
+docker compose up -d       # run in the background instead
+docker compose logs -f     # follow logs if started with -d
+docker compose down        # stop both
+```
+
+**If you change the `Dockerfile` or add a new dependency**, force a real
+rebuild rather than trusting a stale cached image (Compose reuses an
+existing local image with the same tag by default, which can hide
+changes):
+```bash
+docker compose down
+docker compose build --no-cache
+docker compose up
+```
+Verify a specific dependency actually made it into the image if
+something's missing at runtime:
+```bash
+docker run --rm --entrypoint conda earthquake-monitor \
+    run -n openquake_conda python -c "import folium, flask; print('OK')"
+```
+
 ### Notes
 
 - **macOS desktop notifications don't work inside Docker** (containers
@@ -612,10 +653,12 @@ mounted files, one writes, the other only reads.
 - **Windows path syntax differs**: PowerShell uses `${PWD}` instead of
   `$(pwd)`; Command Prompt uses `%cd%`. The `docker build`/`docker run`
   commands themselves are otherwise identical across Mac/Linux/Windows --
-  Docker handles the OS differences internally.
+  Docker handles the OS differences internally. `docker compose` sidesteps
+  this entirely, since paths are defined once in `docker-compose.yml`.
 - **Editing `.env` never requires a rebuild** -- only editing the actual
-  Python files does. This is the whole point of the environment-variable
-  configuration system: reconfigure freely without touching the image.
+  Python files (or the `Dockerfile`'s dependency list) does. This is the
+  whole point of the environment-variable configuration system:
+  reconfigure freely without touching the image.
 
 ## Caveats
 
