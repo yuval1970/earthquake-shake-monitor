@@ -28,9 +28,10 @@ containers sharing the same mounted volumes).
 
 import os
 import sqlite3
+import time
 from datetime import datetime, timezone
 
-from flask import Flask, render_template_string, send_from_directory, abort
+from flask import Flask, render_template_string, send_from_directory, abort, request
 import folium
 
 import config
@@ -80,6 +81,18 @@ INDEX_TEMPLATE = """
               background: #f5f5f5; color: #222; }
         h1 { font-size: 1.5em; margin-bottom: 4px; }
         .subtitle { color: #666; margin-bottom: 20px; font-size: 0.9em; }
+        .filter-bar { background: white; border-radius: 8px; padding: 14px 16px;
+                    margin-bottom: 20px; box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+                    display: flex; gap: 20px; align-items: center; flex-wrap: wrap;
+                    font-size: 0.9em; }
+        .filter-bar label { color: #555; margin-right: 6px; }
+        .filter-bar select, .filter-bar input[type=number] {
+            padding: 5px 8px; border: 1px solid #ddd; border-radius: 5px; font-size: 0.95em; }
+        .filter-bar input[type=number] { width: 70px; }
+        .filter-bar button { padding: 6px 16px; border: none; border-radius: 5px;
+                            background: #2563eb; color: white; cursor: pointer; font-size: 0.9em; }
+        .filter-bar button:hover { background: #1d4ed8; }
+        .filter-bar .checkbox-group { display: flex; align-items: center; gap: 6px; }
         .map-container { margin-bottom: 24px; border-radius: 8px; overflow: hidden;
                         box-shadow: 0 1px 4px rgba(0,0,0,0.15); }
         table { width: 100%; border-collapse: collapse; background: white;
@@ -92,12 +105,36 @@ INDEX_TEMPLATE = """
         .mag-badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
                     color: white; font-weight: 600; font-size: 0.85em; }
         .caution { color: #b45309; font-size: 0.85em; }
+        .test-badge { display: inline-block; padding: 1px 6px; border-radius: 8px;
+                     background: #ddd; color: #555; font-size: 0.75em; margin-left: 6px; }
     </style>
 </head>
 <body>
     <h1>🌍 Earthquake Monitor Dashboard</h1>
-    <p class="subtitle">{{ total_events }} events logged &middot; auto-refreshes every 60s
+    <p class="subtitle">{{ shown_count }} of {{ total_events }} events shown &middot; auto-refreshes every 60s
        &middot; this reports events that have already occurred, it does not predict earthquakes</p>
+
+    <form class="filter-bar" method="get" action="/">
+        <div>
+            <label for="days">Time period:</label>
+            <select name="days" id="days">
+                <option value="1" {% if days == 1 %}selected{% endif %}>Last 24 hours</option>
+                <option value="7" {% if days == 7 %}selected{% endif %}>Last 7 days</option>
+                <option value="30" {% if days == 30 %}selected{% endif %}>Last 30 days</option>
+                <option value="0" {% if days == 0 %}selected{% endif %}>All time</option>
+            </select>
+        </div>
+        <div>
+            <label for="min_mag">Min magnitude:</label>
+            <input type="number" step="0.1" name="min_mag" id="min_mag" value="{{ min_mag }}">
+        </div>
+        <div class="checkbox-group">
+            <input type="checkbox" name="include_test" id="include_test" value="1"
+                  {% if include_test %}checked{% endif %}>
+            <label for="include_test">Include test events</label>
+        </div>
+        <button type="submit">Apply</button>
+    </form>
 
     <div class="map-container">
         {{ map_html | safe }}
@@ -113,7 +150,7 @@ INDEX_TEMPLATE = """
         {% for ev in events %}
         <tr onclick="window.location='/event/{{ ev.id }}'">
             <td><span class="mag-badge" style="background:{{ mag_color(ev.mag) }}">M{{ ev.mag }}</span></td>
-            <td>{{ ev.place }}</td>
+            <td>{{ ev.place }}{% if 'TEST' in (ev.sources or '') %}<span class="test-badge">TEST</span>{% endif %}</td>
             <td>{{ ev.time_str }}</td>
             <td>{{ ev.region_name or '-' }}{% if ev.caution_note %} <span class="caution">⚠</span>{% endif %}</td>
         </tr>
@@ -210,11 +247,40 @@ EVENT_TEMPLATE = """
 
 @app.route("/")
 def index():
+    # Read filters from the query string, with sensible defaults:
+    # last 7 days, magnitude 0+, test events excluded by default.
+    try:
+        days = int(request.args.get("days", 7))
+    except ValueError:
+        days = 7
+    try:
+        min_mag = float(request.args.get("min_mag", 0))
+    except ValueError:
+        min_mag = 0
+    include_test = request.args.get("include_test") == "1"
+
     conn = get_db_connection()
     total_events = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    rows = conn.execute("""
-        SELECT * FROM events ORDER BY event_time DESC LIMIT 200
-    """).fetchall()
+
+    where_clauses = ["mag >= ?"]
+    params = [min_mag]
+
+    if days > 0:
+        cutoff = time.time() - days * 86400
+        where_clauses.append("event_time >= ?")
+        params.append(cutoff)
+
+    if not include_test:
+        # Exclude rows where 'TEST' appears anywhere in the sources field
+        # (test events are logged with sources = "TEST", see run_test_map
+        # in earthquake_monitor_with_shaking.py)
+        where_clauses.append("(sources IS NULL OR sources NOT LIKE '%TEST%')")
+
+    where_sql = " AND ".join(where_clauses)
+    rows = conn.execute(f"""
+        SELECT * FROM events WHERE {where_sql}
+        ORDER BY event_time DESC LIMIT 500
+    """, params).fetchall()
     conn.close()
 
     events = []
@@ -250,7 +316,8 @@ def index():
 
     return render_template_string(
         INDEX_TEMPLATE, events=events, total_events=total_events,
-        map_html=map_html, mag_color=magnitude_color)
+        shown_count=len(events), map_html=map_html, mag_color=magnitude_color,
+        days=days, min_mag=min_mag, include_test=include_test)
 
 
 @app.route("/event/<int:event_id>")
