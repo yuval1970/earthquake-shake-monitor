@@ -177,7 +177,20 @@ else:
 # than showing misleading precision on a physically meaningless number.
 MAX_VALID_DISTANCE_KM = _env_float("MAX_VALID_DISTANCE_KM", 300)
 
-DEFAULT_VS30 = _env_float("DEFAULT_VS30", 400.0)  # fallback ONLY if the real USGS Vs30 lookup fails
+DEFAULT_VS30 = _env_float("DEFAULT_VS30", 400.0)  # fallback ONLY if all Vs30 lookups fail
+
+# Real global Vs30 data (Heath et al. 2020, USGS, CC0 public domain),
+# served as a Cloud-Optimized GeoTIFF from S3. Used to give the shake
+# map's background CONTOUR real per-pixel site conditions, instead of
+# the flat generic assumption previously used there (only the labeled
+# target markers had real Vs30 before this). GDAL reads just the small
+# windowed region each map needs via HTTP range requests -- the full
+# 631MB file is never downloaded.
+VS30_RASTER_URL = _env_str(
+    "VS30_RASTER_URL",
+    "https://prod-is-usgs-sb-prod-publish.s3.amazonaws.com/67be4ac3d34e8876fcbfbd89/vs30_mosaic_median_30c.tif"
+)
+USE_REAL_VS30_RASTER_FOR_BACKGROUND = _env_bool("USE_REAL_VS30_RASTER_FOR_BACKGROUND", True)
 
 # ----------------------------------------------------------------------
 # Region-aware GMPE selection

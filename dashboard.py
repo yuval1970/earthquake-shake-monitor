@@ -296,20 +296,34 @@ def index():
     # load directly in the user's own browser via Leaflet.js, which is
     # genuine browser traffic, so this should work fine here.
     fmap = folium.Map(location=[20, 0], zoom_start=2, tiles="OpenStreetMap")
-    for ev in events:
+
+    for i, ev in enumerate(events):
         if ev["lat"] is None or ev["lon"] is None:
             continue
         popup_html = (f"<b>M{ev['mag']}</b> {ev['place']}<br>"
                       f"{ev['time_str']} UTC<br>"
                       f"<a href='/event/{ev['id']}'>View details</a>")
-        folium.CircleMarker(
-            location=[ev["lat"], ev["lon"]],
-            radius=4 + (ev["mag"] or 0),
-            color=magnitude_color(ev["mag"]),
-            fill=True,
-            fill_opacity=0.7,
-            popup=folium.Popup(popup_html, max_width=250),
-        ).add_to(fmap)
+
+        if i == 0:
+            # Most recent event (events are already sorted DESC by time) --
+            # make it visually distinct and auto-open its popup, so it's
+            # immediately visible without scrolling through the table.
+            folium.Marker(
+                location=[ev["lat"], ev["lon"]],
+                icon=folium.Icon(color="black", icon="star", prefix="fa"),
+                popup=folium.Popup(
+                    f"<b>⭐ Latest event</b><br>{popup_html}",
+                    max_width=250, show=True),
+            ).add_to(fmap)
+        else:
+            folium.CircleMarker(
+                location=[ev["lat"], ev["lon"]],
+                radius=4 + (ev["mag"] or 0),
+                color=magnitude_color(ev["mag"]),
+                fill=True,
+                fill_opacity=0.7,
+                popup=folium.Popup(popup_html, max_width=250),
+            ).add_to(fmap)
 
     map_html = fmap._repr_html_()
 

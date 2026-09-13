@@ -237,6 +237,124 @@ def lookup_vs30(lat, lon):
         _vs30_cache[cache_key] = DEFAULT_VS30
         return DEFAULT_VS30
 
+
+# --------------------------------------------------------------------------
+# Real Vs30 raster sampling (for the shake map BACKGROUND, not just target
+# markers -- see USE_REAL_VS30_RASTER_FOR_BACKGROUND in config.py)
+# --------------------------------------------------------------------------
+
+_vs30_gdal_dataset = None
+_vs30_gdal_load_attempted = False
+
+# Special values in the raster that don't represent real ground Vs30
+# (documented by USGS): 600=ocean, 601=ice, 602=glacier, 603=lake.
+_VS30_RASTER_SPECIAL_VALUES = {600, 601, 602, 603}
+
+
+def _get_vs30_gdal_dataset():
+    """
+    Open the real global Vs30 Cloud-Optimized GeoTIFF via GDAL's
+    /vsicurl/ virtual filesystem, which reads only the small windowed
+    region actually needed per request via HTTP range requests -- the
+    full ~631MB file is never downloaded. Cached after the first
+    successful open. Returns None (with a printed diagnostic) if opening
+    fails for any reason, so callers can fall back to the flat generic
+    Vs30 assumption instead of crashing.
+
+    NOTE: this has not been test-executed against a live connection in
+    this environment. GDAL's vsicurl range-request behavior against this
+    specific S3-hosted file is expected to work (S3 supports HTTP Range
+    natively, and the file is documented as Cloud-Optimized), but if it
+    doesn't, the printed error here will show exactly what GDAL reported,
+    so it can be fixed against real behavior rather than guessed further.
+    """
+    global _vs30_gdal_dataset, _vs30_gdal_load_attempted
+
+    if _vs30_gdal_load_attempted:
+        return _vs30_gdal_dataset
+    _vs30_gdal_load_attempted = True
+
+    try:
+        from osgeo import gdal
+        gdal.UseExceptions()
+        vsicurl_path = f"/vsicurl/{VS30_RASTER_URL}"
+        dataset = gdal.Open(vsicurl_path)
+        if dataset is None:
+            print(f"  [Vs30 raster] gdal.Open returned None for "
+                  f"{vsicurl_path} -- falling back to flat generic Vs30 "
+                  f"for map backgrounds.")
+            return None
+        print(f"  [Vs30 raster] Opened real global Vs30 raster via GDAL "
+              f"vsicurl ({dataset.RasterXSize}x{dataset.RasterYSize} "
+              f"pixels total, reading windowed subsets only)")
+        _vs30_gdal_dataset = dataset
+        return dataset
+    except Exception as e:
+        print(f"  [Vs30 raster] Failed to open real Vs30 raster: "
+              f"{type(e).__name__}: {e} -- falling back to flat generic "
+              f"Vs30 for map backgrounds. Set "
+              f"USE_REAL_VS30_RASTER_FOR_BACKGROUND=false to skip this "
+              f"attempt entirely.")
+        return None
+
+
+def sample_vs30_grid(lat_min, lat_max, lon_min, lon_max, grid_n):
+    """
+    Read a grid_n x grid_n array of REAL Vs30 values covering the given
+    lat/lon bounding box, from the real global Vs30 raster (windowed
+    remote read via GDAL, see _get_vs30_gdal_dataset). Special raster
+    values (ocean/ice/glacier/lake) and any read failure fall back to
+    DEFAULT_VS30 for those cells.
+
+    Returns a (grid_n, grid_n) numpy array, or None if the raster
+    couldn't be opened at all (caller should fall back to a flat value
+    for the whole grid in that case).
+    """
+    dataset = _get_vs30_gdal_dataset()
+    if dataset is None:
+        return None
+
+    try:
+        gt = dataset.GetGeoTransform()  # (origin_x, px_w, 0, origin_y, 0, px_h)
+        origin_x, px_w, _, origin_y, _, px_h = gt
+
+        def lonlat_to_pixel(lon, lat):
+            px = int((lon - origin_x) / px_w)
+            py = int((lat - origin_y) / px_h)
+            return px, py
+
+        # Note: px_h is typically negative (raster rows go north to south)
+        x0, y0 = lonlat_to_pixel(lon_min, lat_max)  # top-left
+        x1, y1 = lonlat_to_pixel(lon_max, lat_min)  # bottom-right
+
+        x0, x1 = max(0, min(x0, x1)), min(dataset.RasterXSize, max(x0, x1))
+        y0, y1 = max(0, min(y0, y1)), min(dataset.RasterYSize, max(y0, y1))
+        win_w, win_h = max(1, x1 - x0), max(1, y1 - y0)
+
+        band = dataset.GetRasterBand(1)
+        raw = band.ReadAsArray(x0, y0, win_w, win_h).astype(float)
+
+        # Replace special non-Vs30 values (ocean/ice/etc.) with the
+        # default fallback, so they don't feed nonsense into the GMPE
+        for special_val in _VS30_RASTER_SPECIAL_VALUES:
+            raw[raw == special_val] = DEFAULT_VS30
+
+        # Resample the raw windowed read to exactly grid_n x grid_n to
+        # match the shake map's display grid resolution
+        if raw.shape != (grid_n, grid_n):
+            import scipy.ndimage
+            zoom_y = grid_n / raw.shape[0]
+            zoom_x = grid_n / raw.shape[1]
+            raw = scipy.ndimage.zoom(raw, (zoom_y, zoom_x), order=1)
+
+        return raw
+
+    except Exception as e:
+        print(f"  [Vs30 raster] Windowed read failed: {type(e).__name__}: "
+              f"{e} -- falling back to flat generic Vs30 for this map.")
+        return None
+
+
 # --------------------------------------------------------------------------
 
 # ============================================================================
@@ -647,13 +765,27 @@ def generate_shakemap_plot(event, in_range_results, out_of_range_results,
     lats = np.linspace(lat - span_deg, lat + span_deg, grid_n)
     lons = np.linspace(lon - span_deg, lon + span_deg, grid_n)
 
-    generic_vs30 = 400.0  # flat background assumption -- see docstring
+    generic_vs30 = 400.0  # fallback if real raster read fails/disabled
     pga_grid = np.zeros((grid_n, grid_n))
 
     region_name, tectonic_type, gmpe, gmpe_name, caution_note = \
         select_gmpe_for_location(event_lat, event_lon)
     if gmpe is None:
         return None  # region_info already printed a diagnostic upstream
+
+    # Try to get REAL per-pixel Vs30 for the whole grid (not just target
+    # markers) from the actual global Vs30 raster. Falls back to the flat
+    # generic_vs30 for the whole grid if disabled or the read fails.
+    vs30_grid = None
+    used_real_vs30_background = False
+    if USE_REAL_VS30_RASTER_FOR_BACKGROUND:
+        vs30_grid = sample_vs30_grid(
+            lat_min=lats.min(), lat_max=lats.max(),
+            lon_min=lons.min(), lon_max=lons.max(),
+            grid_n=grid_n)
+        used_real_vs30_background = vs30_grid is not None
+    if vs30_grid is None:
+        vs30_grid = np.full((grid_n, grid_n), generic_vs30, dtype=float)
 
     for i, la in enumerate(lats):
         row_dists = [haversine_km(event_lat, event_lon, la, lo) for lo in lons]
@@ -664,7 +796,7 @@ def generate_shakemap_plot(event, in_range_results, out_of_range_results,
         ctx.ztor = depth_km
         ctx.rjb = np.array(row_dists, dtype=float)
         ctx.rrup = np.array(row_dists, dtype=float)
-        ctx.vs30 = np.full(grid_n, generic_vs30, dtype=float)
+        ctx.vs30 = vs30_grid[i, :].astype(float)
         ctx.vs30measured = np.full(grid_n, True)
         ctx.z1pt0 = np.full(grid_n, -999.0)
 
@@ -760,7 +892,9 @@ def generate_shakemap_plot(event, in_range_results, out_of_range_results,
                               alpha=contour_alpha)
     scale_note = f"vmax={SHAKEMAP_VMAX}" if SHAKEMAP_VMAX is not None else "auto-scaled"
     scale_type = "log" if SHAKEMAP_LOG_SCALE else "linear"
-    cbar = plt.colorbar(contour, label=f"Estimated PGA (%g), generic Vs30=400 m/s "
+    vs30_note = ("real per-pixel Vs30" if used_real_vs30_background
+                else f"generic Vs30={generic_vs30:.0f} m/s (raster unavailable)")
+    cbar = plt.colorbar(contour, label=f"Estimated PGA (%g), {vs30_note} "
                                      f"[{scale_type}, {scale_note}]")
     if SHAKEMAP_LOG_SCALE:
         # The default tick locator doesn't handle these log-spaced
