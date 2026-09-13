@@ -309,7 +309,7 @@ def send_event_notifications(event):
            f"it does not predict earthquakes before they happen.")
     notify_email(subject, body)
 
-    webhook_message = f"ð *M{mag}* â {event['place']}"
+    webhook_message = f"🌍 *M{mag}* — {event['place']}"
     notify_webhook(webhook_message)
 
 
@@ -319,7 +319,9 @@ def send_event_notifications(event):
 
 def init_history_db():
     """Create the event history database/tables if they don't already
-    exist. Safe to call every startup -- CREATE TABLE IF NOT EXISTS."""
+    exist. Safe to call every startup -- CREATE TABLE IF NOT EXISTS.
+    Also safely migrates existing databases (created before map path
+    columns existed) by adding those columns if missing."""
     conn = sqlite3.connect(HISTORY_DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS events (
@@ -335,9 +337,20 @@ def init_history_db():
             tectonic_type TEXT,
             gmpe_name TEXT,
             caution_note TEXT,
-            detected_at REAL
+            detected_at REAL,
+            regional_map_path TEXT,
+            street_map_path TEXT,
+            zoom_street_map_path TEXT
         )
     """)
+    # Migration for databases created before these columns existed --
+    # ALTER TABLE fails harmlessly if the column is already present.
+    for col in ("regional_map_path", "street_map_path", "zoom_street_map_path"):
+        try:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS shaking_estimates (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -377,9 +390,12 @@ def log_event_to_db(event, sources):
 
 
 def log_shaking_estimate_to_db(event_id, region_name, tectonic_type,
-                              gmpe_name, caution_note, results):
+                              gmpe_name, caution_note, results,
+                              map_paths=None):
     """Update an event's region/GMPE info and log per-target shaking
-    results to the history database."""
+    results to the history database. map_paths (optional) is the dict
+    returned by generate_all_shakemaps(), e.g.
+    {"regional": path, "street": path, "zoom_street": path}."""
     if event_id is None:
         return
     try:
@@ -389,6 +405,14 @@ def log_shaking_estimate_to_db(event_id, region_name, tectonic_type,
                              caution_note=?
             WHERE id=?
         """, (region_name, tectonic_type, gmpe_name, caution_note, event_id))
+
+        if map_paths:
+            conn.execute("""
+                UPDATE events SET regional_map_path=?, street_map_path=?,
+                                 zoom_street_map_path=?
+                WHERE id=?
+            """, (map_paths.get("regional"), map_paths.get("street"),
+                 map_paths.get("zoom_street"), event_id))
 
         for name, dist, vs30, pga in results:
             mmi, desc = pga_to_mmi_description(pga)
@@ -868,9 +892,7 @@ def print_shaking_estimate(event):
               f"(beyond {MAX_VALID_DISTANCE_KM}km -- outside {gmpe_name}'s "
               f"valid range, skipped)")
 
-    log_shaking_estimate_to_db(event.get("_db_id"), region_name,
-                              tectonic_type, gmpe_name, caution_note, results)
-
+    map_paths = {}
     try:
         map_paths = generate_all_shakemaps(event, results, out_of_range)
         for label, path in map_paths.items():
@@ -878,6 +900,10 @@ def print_shaking_estimate(event):
                 print(f"      Shake map ({label}) saved: {path}")
     except Exception as e:
         print(f"      Shake map generation failed: {type(e).__name__}: {e}")
+
+    log_shaking_estimate_to_db(event.get("_db_id"), region_name,
+                              tectonic_type, gmpe_name, caution_note, results,
+                              map_paths=map_paths)
 
     print()
 
@@ -1029,11 +1055,18 @@ def run_test_map(lat=19.5, lon=-155.3, mag=6.5, depth=10.0,
     event at the given location, so the full map (coastlines + strong
     contours + target markers) can be visually verified without waiting
     on real events of sufficient size to happen nearby. Defaults to a
-    Hilo, Hawaii scenario if no location is given."""
+    Hilo, Hawaii scenario if no location is given.
+
+    Also logs the test event to the history database (tagged with
+    source "TEST"), so it shows up in the web dashboard for testing that
+    pipeline too -- this was missing initially, which is why test events
+    weren't appearing in the dashboard."""
     if not _HAZARDLIB_OK:
         print("ERROR: openquake.hazardlib not found. Run inside the "
               "openquake_conda environment.")
         return
+
+    init_history_db()
 
     test_event = {
         "time": time.time(),
@@ -1043,6 +1076,8 @@ def run_test_map(lat=19.5, lon=-155.3, mag=6.5, depth=10.0,
         "depth": depth,
         "place": place,
     }
+
+    test_event["_db_id"] = log_event_to_db(test_event, {"TEST"})
 
     print(f"Generating a TEST shake map with a synthetic M{mag} event "
           f"at ({lat}, {lon}).")
@@ -1169,4 +1204,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

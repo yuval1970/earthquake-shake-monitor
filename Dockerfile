@@ -69,6 +69,7 @@ RUN conda install -n openquake_conda -c conda-forge -y \
     requests \
     contextily \
     geodatasets \
+    flask \
     && conda clean -afy
 
 # Copy the actual project files into the image
@@ -77,11 +78,22 @@ COPY earthquake_monitor_with_shaking.py .
 COPY global_earthquake_monitor.py .
 COPY shakemap_tool.py .
 COPY openquake_shaking_estimate.py .
+COPY dashboard.py .
 
 # Create output directories so volume mounts have somewhere to attach
 RUN mkdir -p /app/shakemaps
 
-# Default command: run the live monitor. Override with `docker run ...
-# earthquake-monitor <different command>` for --test-map, --history-summary,
-# etc.
+# Dashboard runs on this port when started as an alternative command
+# (see usage notes below) -- EXPOSE is documentation for humans/tools,
+# Docker still requires -p at `docker run` time to actually publish it.
+EXPOSE 5001
+
+# Default command: run the live monitor. To run the dashboard instead
+# (in a separate container, sharing the same mounted volumes), override
+# both --entrypoint and the command, e.g.:
+#   docker run -it --rm -p 5001:5001 \
+#       -v $(pwd)/shakemaps:/app/shakemaps \
+#       -v $(pwd)/earthquake_history.db:/app/earthquake_history.db \
+#       --entrypoint conda earthquake-monitor \
+#       run --no-capture-output -n openquake_conda python dashboard.py
 ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "openquake_conda", "python", "earthquake_monitor_with_shaking.py"]
