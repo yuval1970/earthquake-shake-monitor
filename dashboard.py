@@ -12,9 +12,8 @@ independently of the live monitor without affecting it.
 
 REQUIREMENTS
 ------------
-    pip install flask
-    (folium is already installed as a bundled dependency of geopandas/
-    openquake.engine in the openquake_conda environment)
+    pip install flask folium
+    (or: conda install -c conda-forge flask folium)
 
 USAGE
 -----

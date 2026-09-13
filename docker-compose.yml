@@ -1,0 +1,50 @@
+# docker-compose.yml
+#
+# Runs the live monitor and the web dashboard together as two containers,
+# sharing the same mounted files (shake maps folder, history database),
+# so you don't need two separate terminals running `docker run` by hand.
+#
+# USAGE
+# -----
+#   docker compose up          # starts both, logs interleaved in one terminal
+#   docker compose up -d       # starts both in the background
+#   docker compose logs -f     # follow logs if started with -d
+#   docker compose down        # stop both
+#
+# Before first use:
+#   touch earthquake_history.db   # see README -- avoids a bind-mount gotcha
+#   docker compose build          # builds the image once (same as `docker build`)
+#
+# Configuration: create a .env file in this same folder (see README's
+# "Configuration" section) -- docker compose reads it automatically, no
+# --env-file flag needed.
+
+services:
+  monitor:
+    build: .
+    image: earthquake-monitor
+    container_name: earthquake-monitor
+    env_file:
+      - .env
+    volumes:
+      - ./shakemaps:/app/shakemaps
+      - ./earthquake_history.db:/app/earthquake_history.db
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+  dashboard:
+    build: .
+    image: earthquake-monitor
+    container_name: earthquake-dashboard
+    env_file:
+      - .env
+    volumes:
+      - ./shakemaps:/app/shakemaps
+      - ./earthquake_history.db:/app/earthquake_history.db
+    ports:
+      - "5001:5001"
+    entrypoint: ["conda", "run", "--no-capture-output", "-n", "openquake_conda", "python", "dashboard.py"]
+    restart: unless-stopped
+    depends_on:
+      - monitor
