@@ -356,6 +356,290 @@ def sample_vs30_grid(lat_min, lat_max, lon_min, lon_max, grid_n):
 
 
 # --------------------------------------------------------------------------
+# Real seismic station data overlay (see STATION_OVERLAY_ENABLED in config.py)
+# --------------------------------------------------------------------------
+
+def find_and_measure_nearby_stations(event_lat, event_lon, event_time_unix,
+                                     radius_km=None, max_stations=None):
+    """
+    Search for REAL seismic stations near the event using EIDA and IRIS
+    routing clients (rather than assuming one fixed network like GE,
+    which was confirmed too geographically sparse for most target
+    regions -- concentrated in Europe/Mediterranean, near-absent in the
+    Pacific). For each found station (closest first, up to
+    max_stations), fetch its actual recorded waveform for the event
+    time window, remove the real instrument response, and compute the
+    genuinely OBSERVED peak ground acceleration (PGA, %g) -- not a
+    model estimate.
+
+    Returns a list of dicts: {network, station, lat, lon, distance_km,
+    channel, observed_pga_percent_g}, sorted by distance. Returns an
+    empty list if no stations are found, or if all fetches fail -- this
+    is EXPECTED and normal for most events (station coverage is
+    genuinely sparse globally), not necessarily a sign of a problem.
+
+    HONEST CAVEAT: this has not been test-executed against a live
+    network in this environment. The routing-client search pattern and
+    remove_response(output="ACC") approach follow ObsPy's documented
+    API, but real-world station/channel availability, response metadata
+    quality, and routing-client behavior vary in practice and haven't
+    been verified against live results. Failures for individual
+    stations are caught and skipped (with a diagnostic printed) rather
+    than stopping the whole search, so partial results are still useful
+    and issues can be fixed against real behavior rather than guessed
+    further.
+    """
+    if not STATION_OVERLAY_ENABLED:
+        return []
+
+    radius_km = radius_km or STATION_SEARCH_RADIUS_KM
+    max_stations = max_stations or STATION_OVERLAY_MAX_STATIONS
+
+    try:
+        from obspy.clients.fdsn import RoutingClient
+        from obspy import UTCDateTime
+    except ImportError:
+        print("  [stations] obspy not installed -- skipping real station "
+              "data overlay. Install with: conda install -c conda-forge obspy")
+        return []
+
+    event_time = UTCDateTime(event_time_unix)
+    radius_deg = radius_km / 111.0  # rough km-to-degree conversion
+
+    # Try both EIDA (strong in Europe/Mediterranean) and IRIS's FedCatalog
+    # (broader global reach) -- merge results, since neither alone covers
+    # every region well (confirmed earlier: GE/GEOFON alone is sparse
+    # outside Europe).
+    all_stations = {}  # keyed by (network, station) to dedupe
+    for router_name in ("eida-routing", "earthscope-federator"):
+        try:
+            client = RoutingClient(router_name)
+            inv = client.get_stations(
+                latitude=event_lat, longitude=event_lon,
+                maxradius=radius_deg,
+                channel="BH?,HH?,EN?,HN?",
+                starttime=event_time - 3600, endtime=event_time + 3600,
+                level="channel",
+            )
+            for net in inv:
+                for sta in net:
+                    key = (net.code, sta.code)
+                    if key not in all_stations:
+                        dist = haversine_km(event_lat, event_lon,
+                                            sta.latitude, sta.longitude)
+                        channels = sorted(set(c.code for c in sta))
+                        all_stations[key] = {
+                            "network": net.code, "station": sta.code,
+                            "lat": sta.latitude, "lon": sta.longitude,
+                            "distance_km": dist, "channels": channels,
+                        }
+        except Exception as e:
+            print(f"  [stations] {router_name} search failed (this router "
+                  f"may just not cover this region): {type(e).__name__}: {e}")
+            continue
+
+    if not all_stations:
+        print(f"  [stations] No real stations found within {radius_km}km "
+              f"of the event -- this is common, not necessarily an error.")
+        return []
+
+    closest = sorted(all_stations.values(), key=lambda s: s["distance_km"])[:max_stations]
+    print(f"  [stations] Found {len(all_stations)} real station(s) within "
+          f"{radius_km}km, measuring the closest {len(closest)}...")
+
+    results = []
+    for station_info in closest:
+        net_code = station_info["network"]
+        sta_code = station_info["station"]
+        # Prefer strong-motion accelerometer channels (EN?/HN?) if
+        # available, otherwise fall back to broadband (BH?/HH?) --
+        # remove_response(output="ACC") correctly deconvolves either
+        # instrument type to real acceleration units.
+        preferred_order = ["EN", "HN", "BH", "HH"]
+        channel_prefix = next(
+            (p for p in preferred_order
+            if any(c.startswith(p) for c in station_info["channels"])),
+            None)
+        if channel_prefix is None:
+            continue
+
+        try:
+            client = RoutingClient("eida-routing")
+
+            starttime = event_time - 60
+            endtime = event_time + 300
+            channel_code = f"{channel_prefix}Z"
+
+            # Fetch the waveform WITHOUT attach_response -- confirmed via
+            # a real error that RoutingClient.get_waveforms() doesn't
+            # support that convenience argument at all ("The
+            # `attach_response` argument is not supported"). Fetch the
+            # instrument response separately instead, and attach it
+            # manually -- the standard ObsPy workaround for this case.
+            st = client.get_waveforms(
+                network=net_code, station=sta_code, location="*",
+                channel=channel_code, starttime=starttime, endtime=endtime,
+            )
+
+            if len(st) == 0:
+                print(f"  [stations] {net_code}.{sta_code}: no waveform "
+                      f"data returned, skipping")
+                continue
+
+            try:
+                inv = client.get_stations(
+                    network=net_code, station=sta_code, location="*",
+                    channel=channel_code, starttime=starttime,
+                    endtime=endtime, level="response",
+                )
+            except Exception as e:
+                print(f"  [stations] {net_code}.{sta_code}: failed to "
+                      f"fetch instrument response ({type(e).__name__}: "
+                      f"{e}), skipping")
+                continue
+
+            tr = st[0]
+            tr.detrend("demean")
+            # Pass inventory directly (not the deprecated attach_response()
+            # pattern -- confirmed via a real ObsPyDeprecationWarning
+            # suggesting this exact fix)
+            tr.remove_response(inventory=inv, output="ACC")  # -> real acceleration, m/s^2
+
+            pga_ms2 = float(np.max(np.abs(tr.data)))
+            pga_percent_g = pga_ms2 / 9.81 * 100
+
+            results.append({
+                "network": net_code, "station": sta_code,
+                "lat": station_info["lat"], "lon": station_info["lon"],
+                "distance_km": station_info["distance_km"],
+                "channel": channel_code,
+                "observed_pga_percent_g": pga_percent_g,
+            })
+            print(f"  [stations] {net_code}.{sta_code} "
+                  f"({station_info['distance_km']:.0f}km): OBSERVED "
+                  f"PGA = {pga_percent_g:.3f} %g (real waveform)")
+
+        except Exception as e:
+            print(f"  [stations] {net_code}.{sta_code}: measurement "
+                  f"failed ({type(e).__name__}: {e}), skipping")
+            continue
+
+    return results
+
+
+def merge_station_data_into_grid(pga_grid, lats, lons, gmpe, magnitude,
+                                depth_km, event_lat, event_lon, station_data):
+    """
+    Blend real station observations into the model-computed pga_grid,
+    producing a corrected grid (NOT modifying pga_grid in place -- returns
+    a new array). This is a SEPARATE operation from just plotting station
+    markers -- it actually adjusts the background contour, similar in
+    spirit to how real operational ShakeMap systems combine model and
+    observed data.
+
+    Method (a simplified inverse-distance-weighted bias correction, not
+    full kriging -- a reasonable, explainable approximation rather than
+    a research-grade interpolation):
+      1. For each station, compute what the MODEL predicts at that exact
+         point (same magnitude/depth/distance/Vs30 inputs used for the
+         real target markers), then bias = observed / model.
+      2. For each grid cell, find stations within MERGE_INFLUENCE_RADIUS_KM.
+         Weight each by how close it is (linear taper to zero at the
+         radius edge, so the correction fades smoothly rather than
+         jumping abruptly at the boundary).
+      3. Blend: merged = model * (1 + total_weight * (weighted_bias - 1)),
+         where total_weight is capped at 1. Close to a station, this
+         pulls the model strongly toward the real observation; far from
+         any station (or beyond the influence radius), it reverts to the
+         pure model estimate unchanged.
+
+    Returns the merged grid, or the original pga_grid unchanged if no
+    station_data is provided or no station has valid model comparison.
+    """
+    if not station_data:
+        return pga_grid
+
+    # Step 1: model-predicted PGA at each station's exact location, and
+    # the resulting bias (observed / model)
+    station_biases = []
+    for sd in station_data:
+        try:
+            dist_km = haversine_km(event_lat, event_lon, sd["lat"], sd["lon"])
+            station_vs30 = lookup_vs30(sd["lat"], sd["lon"])
+
+            ctx = RuptureContext()
+            ctx.mag = magnitude
+            ctx.rake = 0.0
+            ctx.dip = 90.0
+            ctx.ztor = depth_km
+            ctx.rjb = np.array([dist_km], dtype=float)
+            ctx.rrup = np.array([dist_km], dtype=float)
+            ctx.vs30 = np.array([station_vs30], dtype=float)
+            ctx.vs30measured = np.array([True])
+            ctx.z1pt0 = np.array([-999.0])
+
+            imts = [PGA()]
+            mean = np.zeros((1, 1))
+            sig = np.zeros((1, 1))
+            tau = np.zeros((1, 1))
+            phi = np.zeros((1, 1))
+            gmpe.compute(ctx, imts, mean, sig, tau, phi)
+            model_pga_at_station = float(np.exp(mean[0, 0]) * 100)
+
+            # Guard against dividing by a near-zero model prediction,
+            # which would produce an extreme/meaningless bias ratio
+            if model_pga_at_station < 0.01:
+                print(f"  [merge] {sd['network']}.{sd['station']}: model "
+                      f"prediction too small ({model_pga_at_station:.4f}%g) "
+                      f"to compute a meaningful bias, skipping this "
+                      f"station for merging")
+                continue
+
+            bias = sd["observed_pga_percent_g"] / model_pga_at_station
+            station_biases.append({
+                "lat": sd["lat"], "lon": sd["lon"], "bias": bias,
+                "network": sd["network"], "station": sd["station"],
+            })
+            print(f"  [merge] {sd['network']}.{sd['station']}: model "
+                  f"predicted {model_pga_at_station:.3f}%g, observed "
+                  f"{sd['observed_pga_percent_g']:.3f}%g -> bias={bias:.3f}")
+
+        except Exception as e:
+            print(f"  [merge] Failed to compute bias for "
+                  f"{sd.get('network')}.{sd.get('station')}: "
+                  f"{type(e).__name__}: {e}, skipping")
+            continue
+
+    if not station_biases:
+        return pga_grid
+
+    # Step 2 + 3: IDW-weighted blend across the grid
+    merged = pga_grid.copy()
+    grid_n = pga_grid.shape[0]
+    for i in range(grid_n):
+        for j in range(grid_n):
+            cell_lat, cell_lon = lats[i], lons[j]
+            total_weight = 0.0
+            weighted_bias_sum = 0.0
+            for sb in station_biases:
+                dist = haversine_km(cell_lat, cell_lon, sb["lat"], sb["lon"])
+                if dist >= MERGE_INFLUENCE_RADIUS_KM:
+                    continue
+                weight = ((MERGE_INFLUENCE_RADIUS_KM - dist)
+                         / MERGE_INFLUENCE_RADIUS_KM) ** 2
+                total_weight += weight
+                weighted_bias_sum += weight * sb["bias"]
+
+            if total_weight > 0:
+                weighted_bias = weighted_bias_sum / total_weight
+                blend_factor = min(1.0, total_weight)
+                merged[i, j] = pga_grid[i, j] * (
+                    1 + blend_factor * (weighted_bias - 1))
+
+    return merged
+
+
+# --------------------------------------------------------------------------
 
 # ============================================================================
 # Notifications (email + optional webhook)
@@ -729,7 +1013,8 @@ def _load_world_boundaries():
 def generate_shakemap_plot(event, in_range_results, out_of_range_results,
                           center_lat=None, center_lon=None, span_deg=None,
                           provider_name=None, filename_suffix="",
-                          map_label="Regional"):
+                          map_label="Regional", station_data=None,
+                          merge_stations=False):
     """
     Generate a visual shake map: a contour plot of estimated PGA around a
     center point (using a generic Vs30 for the background field, since
@@ -807,6 +1092,15 @@ def generate_shakemap_plot(event, in_range_results, out_of_range_results,
         phi = np.zeros((1, grid_n))
         gmpe.compute(ctx, imts, mean, sig, tau, phi)
         pga_grid[i, :] = np.exp(mean[0]) * 100
+
+    used_merge = False
+    if merge_stations and station_data:
+        print(f"  [merge] Blending {len(station_data)} real station "
+              f"observation(s) into the '{map_label}' map...")
+        pga_grid = merge_station_data_into_grid(
+            pga_grid, lats, lons, gmpe, magnitude, depth_km,
+            event_lat, event_lon, station_data)
+        used_merge = True
 
     fig, ax = plt.subplots(figsize=(9, 7))
 
@@ -894,7 +1188,8 @@ def generate_shakemap_plot(event, in_range_results, out_of_range_results,
     scale_type = "log" if SHAKEMAP_LOG_SCALE else "linear"
     vs30_note = ("real per-pixel Vs30" if used_real_vs30_background
                 else f"generic Vs30={generic_vs30:.0f} m/s (raster unavailable)")
-    cbar = plt.colorbar(contour, label=f"Estimated PGA (%g), {vs30_note} "
+    merge_note = ", MERGED w/ real station data" if used_merge else ""
+    cbar = plt.colorbar(contour, label=f"Estimated PGA (%g), {vs30_note}{merge_note} "
                                      f"[{scale_type}, {scale_note}]")
     if SHAKEMAP_LOG_SCALE:
         # The default tick locator doesn't handle these log-spaced
@@ -929,6 +1224,26 @@ def generate_shakemap_plot(event, in_range_results, out_of_range_results,
     # Note: out-of-range targets aren't plotted here since they fall
     # outside this map's extent.
 
+    # Real station data overlay -- distinct green triangles showing
+    # genuinely OBSERVED PGA from actual waveform recordings, alongside
+    # the model-based target estimates above. Only stations within this
+    # map's current visible extent are plotted (others may be outside
+    # this particular zoom level).
+    x_min, x_max = ax.get_xlim()
+    y_min, y_max = ax.get_ylim()
+    for sd in (station_data or []):
+        if not (x_min <= sd["lon"] <= x_max and y_min <= sd["lat"] <= y_max):
+            continue
+        ax.plot(sd["lon"], sd["lat"], "^", color="green", markersize=10,
+               markeredgecolor="black", zorder=7)
+        ax.annotate(f"{sd['network']}.{sd['station']} (REAL)\n"
+                   f"{sd['distance_km']:.0f}km, {sd['channel']}\n"
+                   f"Observed PGA={sd['observed_pga_percent_g']:.3f}%g",
+                   (sd["lon"], sd["lat"]), textcoords="offset points",
+                   xytext=(8, -8), fontsize=7, color="darkgreen",
+                   bbox=dict(boxstyle="round,pad=0.2", fc="white",
+                            ec="green", alpha=0.85))
+
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_title(f"{map_label} Shake Map ({gmpe_name} estimate, "
@@ -947,26 +1262,40 @@ def generate_shakemap_plot(event, in_range_results, out_of_range_results,
     return filename
 
 
-def generate_all_shakemaps(event, in_range_results, out_of_range_results):
+def generate_all_shakemaps(event, in_range_results, out_of_range_results,
+                          station_data=None):
     """
-    Generate all three shake map outputs:
+    Generate the shake map outputs:
       1. Regional overview (span based on MAX_VALID_DISTANCE_KM, centered
-         on the epicenter) -- the original behavior.
+         on the epicenter) -- the original behavior, PURE MODEL (no
+         station merging), with real station markers overlaid if any exist.
       2. Street-level view (STREET_MAP_SPAN_DEG, ~55km) -- centered on
          the nearest in-range target if one exists, otherwise the
-         epicenter.
+         epicenter. Also pure model + station markers.
       3. Zoomed street-level close-up (ZOOM_STREET_MAP_SPAN_DEG, ~3.3km,
          building/street scale) -- same centering logic as #2.
+      4. (Optional, only when SHAKEMAP_MERGE_STATION_DATA is enabled AND
+         real station data was found) "regional_merged" -- a SEPARATE
+         regional map where real station observations are actually
+         blended into the background contour via inverse-distance-
+         weighted bias correction (see merge_station_data_into_grid()),
+         not just plotted as markers. Maps 1-3 are never altered by this
+         -- this is an additional, distinct file.
+
+    station_data (optional): list of real station measurements from
+    find_and_measure_nearby_stations(), plotted as distinct markers
+    showing genuinely OBSERVED PGA alongside the model estimate.
 
     Returns a dict of {label: filepath_or_None}.
     """
     results = {}
+    station_data = station_data or []
 
     # Map 1: regional overview, centered on the epicenter (unchanged
     # default behavior)
     results["regional"] = generate_shakemap_plot(
         event, in_range_results, out_of_range_results,
-        filename_suffix="", map_label="Regional")
+        filename_suffix="", map_label="Regional", station_data=station_data)
 
     # Pick a center for the two zoomed views: the closest in-range
     # target if any, otherwise fall back to the epicenter itself.
@@ -984,7 +1313,7 @@ def generate_all_shakemaps(event, in_range_results, out_of_range_results):
         center_lat=center_lat, center_lon=center_lon,
         span_deg=STREET_MAP_SPAN_DEG,
         provider_name=SHAKEMAP_CONTEXTILY_PROVIDER,
-        filename_suffix="_street", map_label="Street")
+        filename_suffix="_street", map_label="Street", station_data=station_data)
 
     # Map 3: zoomed street-level close-up (building/street scale)
     results["zoom_street"] = generate_shakemap_plot(
@@ -992,7 +1321,19 @@ def generate_all_shakemaps(event, in_range_results, out_of_range_results):
         center_lat=center_lat, center_lon=center_lon,
         span_deg=ZOOM_STREET_MAP_SPAN_DEG,
         provider_name=SHAKEMAP_CONTEXTILY_PROVIDER,
-        filename_suffix="_zoom_street", map_label="Zoomed Street")
+        filename_suffix="_zoom_street", map_label="Zoomed Street",
+        station_data=station_data)
+
+    # Map 4 (optional): regional view with real station data actually
+    # MERGED/blended into the background contour, not just plotted as
+    # markers -- a SEPARATE file from map 1, so the pure-model maps
+    # above are never altered. Only generated when the feature is
+    # enabled AND real station data was actually found for this event.
+    if SHAKEMAP_MERGE_STATION_DATA and station_data:
+        results["regional_merged"] = generate_shakemap_plot(
+            event, in_range_results, out_of_range_results,
+            filename_suffix="_merged", map_label="Regional",
+            station_data=station_data, merge_stations=True)
 
     return results
 
@@ -1026,9 +1367,21 @@ def print_shaking_estimate(event):
               f"(beyond {MAX_VALID_DISTANCE_KM}km -- outside {gmpe_name}'s "
               f"valid range, skipped)")
 
+    station_data = []
+    try:
+        station_data = find_and_measure_nearby_stations(
+            event["lat"], event["lon"], event["time"])
+        if not station_data:
+            print(f"      No real station data available near this event "
+                  f"(this is common -- station coverage is genuinely "
+                  f"sparse in most regions).")
+    except Exception as e:
+        print(f"      Real station search failed: {type(e).__name__}: {e}")
+
     map_paths = {}
     try:
-        map_paths = generate_all_shakemaps(event, results, out_of_range)
+        map_paths = generate_all_shakemaps(event, results, out_of_range,
+                                          station_data=station_data)
         for label, path in map_paths.items():
             if path:
                 print(f"      Shake map ({label}) saved: {path}")
@@ -1184,12 +1537,22 @@ def run_usgs_poller():
 # ============================================================================
 
 def run_test_map(lat=19.5, lon=-155.3, mag=6.5, depth=10.0,
-                 place="TEST EVENT near Hilo, Hawaii (synthetic, not real)"):
+                 place="TEST EVENT near Hilo, Hawaii (synthetic, not real)",
+                 hours_ago=48):
     """Generate one shake map immediately using a synthetic, high-magnitude
     event at the given location, so the full map (coastlines + strong
     contours + target markers) can be visually verified without waiting
     on real events of sufficient size to happen nearby. Defaults to a
     Hilo, Hawaii scenario if no location is given.
+
+    hours_ago (default 48): how far in the past to timestamp the
+    synthetic event. Defaults to 2 days ago rather than "right now",
+    since FDSN data centers typically need time to ingest/archive very
+    recent waveform data -- confirmed repeatedly earlier in this project
+    (real events timestamped "now" reliably returned empty/204 responses
+    for both the Vs30 service and real station waveform fetches, purely
+    due to this latency, not a real absence of data). An older timestamp
+    gives station data a realistic chance of actually being available.
 
     Also logs the test event to the history database (tagged with
     source "TEST"), so it shows up in the web dashboard for testing that
@@ -1203,7 +1566,7 @@ def run_test_map(lat=19.5, lon=-155.3, mag=6.5, depth=10.0,
     init_history_db()
 
     test_event = {
-        "time": time.time(),
+        "time": time.time() - hours_ago * 3600,
         "lat": lat,
         "lon": lon,
         "mag": mag,
@@ -1281,6 +1644,15 @@ def main():
                         help="Test event magnitude (default 6.5)")
     parser.add_argument("--test-depth", type=float, default=10.0,
                         help="Test event depth in km (default 10)")
+    parser.add_argument("--test-hours-ago", type=float, default=48,
+                        help="How many hours in the past to timestamp "
+                             "the synthetic test event (default 48). "
+                             "FDSN data centers need time to ingest/"
+                             "archive very recent data -- a timestamp "
+                             "of 'right now' often returns no station "
+                             "data purely due to this latency, not a "
+                             "real absence of data. Use 0 to test "
+                             "against the current moment anyway.")
     parser.add_argument("--history-summary", action="store_true",
                         help="Print a quick summary of events logged so "
                              "far in the history database, then exit "
@@ -1303,7 +1675,8 @@ def main():
         lat = args.test_lat if args.test_lat is not None else preset_lat
         lon = args.test_lon if args.test_lon is not None else preset_lon
         run_test_map(lat=lat, lon=lon, mag=args.test_mag,
-                    depth=args.test_depth, place=preset_place)
+                    depth=args.test_depth, place=preset_place,
+                    hours_ago=args.test_hours_ago)
         return
 
     init_history_db()

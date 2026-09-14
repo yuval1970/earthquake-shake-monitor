@@ -71,6 +71,7 @@ RUN conda install -n openquake_conda -c conda-forge -y \
     geodatasets \
     flask \
     folium \
+    obspy \
     && conda clean -afy
 
 # Copy the actual project files into the image

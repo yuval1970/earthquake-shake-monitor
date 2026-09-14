@@ -193,6 +193,34 @@ VS30_RASTER_URL = _env_str(
 USE_REAL_VS30_RASTER_FOR_BACKGROUND = _env_bool("USE_REAL_VS30_RASTER_FOR_BACKGROUND", True)
 
 # ----------------------------------------------------------------------
+# Real seismic station data overlay
+# ----------------------------------------------------------------------
+# In addition to the GMPE-based model, search for real nearby seismic
+# stations (via EIDA/IRIS routing clients -- not just one fixed network
+# like GE, which is too geographically sparse for most target regions)
+# and fetch their actual recorded waveform for the event, computing a
+# genuinely OBSERVED PGA to overlay on the shake map alongside the
+# model's estimate. Coverage will be sparse for many events/regions --
+# this is expected, not a bug -- most events will simply show no nearby
+# station data, same as before.
+STATION_OVERLAY_ENABLED = _env_bool("STATION_OVERLAY_ENABLED", True)
+STATION_SEARCH_RADIUS_KM = _env_float("STATION_SEARCH_RADIUS_KM", 300)
+STATION_OVERLAY_MAX_STATIONS = _env_int("STATION_OVERLAY_MAX_STATIONS", 5)
+
+# When real station data is available, ALSO generate a separate "merged"
+# regional map that blends real observations into the model's background
+# contour (not just plotted as separate markers, like the maps above).
+# Near each real station, the model is corrected toward what was actually
+# observed; the correction fades out with distance, reverting to the pure
+# GMPE estimate beyond MERGE_INFLUENCE_RADIUS_KM. This is closer to how
+# real operational ShakeMap systems work, and produces a genuinely
+# different (usually more accurate near stations) map than the
+# model-only ones -- kept as a SEPARATE file so the pure-model maps are
+# never altered.
+SHAKEMAP_MERGE_STATION_DATA = _env_bool("SHAKEMAP_MERGE_STATION_DATA", True)
+MERGE_INFLUENCE_RADIUS_KM = _env_float("MERGE_INFLUENCE_RADIUS_KM", 150)
+
+# ----------------------------------------------------------------------
 # Region-aware GMPE selection
 # ----------------------------------------------------------------------
 # A single fixed GMPE will still compute *a* number for an earthquake
