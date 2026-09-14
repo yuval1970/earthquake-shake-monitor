@@ -433,6 +433,18 @@ def find_and_measure_nearby_stations(event_lat, event_lon, event_time_unix,
                             "network": net.code, "station": sta.code,
                             "lat": sta.latitude, "lon": sta.longitude,
                             "distance_km": dist, "channels": channels,
+                            "discovered_via": router_name,  # remember which
+                            # router actually found this station, so the
+                            # waveform FETCH below can use the same router
+                            # instead of always hardcoding eida-routing --
+                            # confirmed via real evidence this matters:
+                            # every single US-network station (found via
+                            # earthscope-federator) failed consistently
+                            # when the fetch was forced through eida-routing
+                            # regardless, while GE (found via eida-routing)
+                            # succeeded -- EIDA is fundamentally a European
+                            # aggregator and likely can locate but not
+                            # actually serve non-European waveform data.
                         }
         except Exception as e:
             print(f"  [stations] {router_name} search failed (this router "
@@ -466,7 +478,13 @@ def find_and_measure_nearby_stations(event_lat, event_lon, event_time_unix,
             continue
 
         try:
-            client = RoutingClient("eida-routing")
+            # Use the SAME router that actually discovered this station,
+            # not always eida-routing -- fixes a real, confirmed bug:
+            # EIDA can locate but apparently not serve non-European
+            # (e.g. US network) waveform data, causing every such
+            # station to fail even when genuinely active.
+            fetch_router = station_info.get("discovered_via", "eida-routing")
+            client = RoutingClient(fetch_router)
 
             starttime = event_time - 60
             endtime = event_time + 300
