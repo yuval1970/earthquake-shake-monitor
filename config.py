@@ -207,6 +207,24 @@ STATION_OVERLAY_ENABLED = _env_bool("STATION_OVERLAY_ENABLED", True)
 STATION_SEARCH_RADIUS_KM = _env_float("STATION_SEARCH_RADIUS_KM", 300)
 STATION_OVERLAY_MAX_STATIONS = _env_int("STATION_OVERLAY_MAX_STATIONS", 5)
 
+# Independent local magnitude (ML) cross-check, computed from each real
+# station's actual waveform (Wood-Anderson simulation + Hutton & Boore
+# 1987 formula -- widely used, but calibrated for Southern California,
+# NOT locally calibrated for wherever the event actually is). Purely a
+# rough illustrative sanity check against the reported USGS/EMSC
+# magnitude, not a rigorous independent determination.
+ESTIMATE_LOCAL_MAGNITUDE = _env_bool("ESTIMATE_LOCAL_MAGNITUDE", True)
+
+# When a station fetch fails with a "might just be too soon" type error
+# (as opposed to a permanent "this station definitely has no data" type
+# error), queue the event for an automatic retry later, rather than
+# giving up permanently. See earthquake_monitor_with_shaking.py's
+# _is_retry_worthy_error() for the classification logic.
+STATION_RETRY_ENABLED = _env_bool("STATION_RETRY_ENABLED", True)
+STATION_RETRY_DELAY_MINUTES = _env_float("STATION_RETRY_DELAY_MINUTES", 30)
+STATION_RETRY_MAX_ATTEMPTS = _env_int("STATION_RETRY_MAX_ATTEMPTS", 3)
+STATION_RETRY_CHECK_INTERVAL_SEC = _env_int("STATION_RETRY_CHECK_INTERVAL_SEC", 600)
+
 # When real station data is available, ALSO generate a separate "merged"
 # regional map that blends real observations into the model's background
 # contour (not just plotted as separate markers, like the maps above).

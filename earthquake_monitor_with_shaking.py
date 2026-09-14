@@ -360,7 +360,8 @@ def sample_vs30_grid(lat_min, lat_max, lon_min, lon_max, grid_n):
 # --------------------------------------------------------------------------
 
 def find_and_measure_nearby_stations(event_lat, event_lon, event_time_unix,
-                                     radius_km=None, max_stations=None):
+                                     radius_km=None, max_stations=None,
+                                     reported_magnitude=None):
     """
     Search for REAL seismic stations near the event using EIDA and IRIS
     routing clients (rather than assuming one fixed network like GE,
@@ -390,7 +391,7 @@ def find_and_measure_nearby_stations(event_lat, event_lon, event_time_unix,
     further.
     """
     if not STATION_OVERLAY_ENABLED:
-        return []
+        return [], False
 
     radius_km = radius_km or STATION_SEARCH_RADIUS_KM
     max_stations = max_stations or STATION_OVERLAY_MAX_STATIONS
@@ -401,7 +402,7 @@ def find_and_measure_nearby_stations(event_lat, event_lon, event_time_unix,
     except ImportError:
         print("  [stations] obspy not installed -- skipping real station "
               "data overlay. Install with: conda install -c conda-forge obspy")
-        return []
+        return [], False
 
     event_time = UTCDateTime(event_time_unix)
     radius_deg = radius_km / 111.0  # rough km-to-degree conversion
@@ -441,13 +442,14 @@ def find_and_measure_nearby_stations(event_lat, event_lon, event_time_unix,
     if not all_stations:
         print(f"  [stations] No real stations found within {radius_km}km "
               f"of the event -- this is common, not necessarily an error.")
-        return []
+        return [], False
 
     closest = sorted(all_stations.values(), key=lambda s: s["distance_km"])[:max_stations]
     print(f"  [stations] Found {len(all_stations)} real station(s) within "
           f"{radius_km}km, measuring the closest {len(closest)}...")
 
     results = []
+    had_retryable_failure = False
     for station_info in closest:
         net_code = station_info["network"]
         sta_code = station_info["station"]
@@ -484,6 +486,7 @@ def find_and_measure_nearby_stations(event_lat, event_lon, event_time_unix,
             if len(st) == 0:
                 print(f"  [stations] {net_code}.{sta_code}: no waveform "
                       f"data returned, skipping")
+                had_retryable_failure = True
                 continue
 
             try:
@@ -508,23 +511,113 @@ def find_and_measure_nearby_stations(event_lat, event_lon, event_time_unix,
             pga_ms2 = float(np.max(np.abs(tr.data)))
             pga_percent_g = pga_ms2 / 9.81 * 100
 
+            # Independent local magnitude (ML) cross-check, computed from
+            # this same real waveform/response. NOT a required part of
+            # the pipeline -- wrapped so any failure here never affects
+            # the PGA measurement above, which is the primary result.
+            estimated_ml = None
+            if ESTIMATE_LOCAL_MAGNITUDE:
+                try:
+                    estimated_ml = _estimate_local_magnitude(
+                        st[0], inv, station_info["distance_km"])
+                except Exception as e:
+                    print(f"  [stations] {net_code}.{sta_code}: ML "
+                          f"estimation failed ({type(e).__name__}: {e}), "
+                          f"continuing without it")
+
             results.append({
                 "network": net_code, "station": sta_code,
                 "lat": station_info["lat"], "lon": station_info["lon"],
                 "distance_km": station_info["distance_km"],
                 "channel": channel_code,
                 "observed_pga_percent_g": pga_percent_g,
+                "estimated_ml": estimated_ml,
             })
+            ml_str = f", ML~{estimated_ml:.1f}" if estimated_ml is not None else ""
             print(f"  [stations] {net_code}.{sta_code} "
                   f"({station_info['distance_km']:.0f}km): OBSERVED "
-                  f"PGA = {pga_percent_g:.3f} %g (real waveform)")
+                  f"PGA = {pga_percent_g:.3f} %g (real waveform){ml_str}")
 
         except Exception as e:
             print(f"  [stations] {net_code}.{sta_code}: measurement "
                   f"failed ({type(e).__name__}: {e}), skipping")
+            if _is_retry_worthy_error(str(e)):
+                had_retryable_failure = True
             continue
 
-    return results
+    # Print an overall comparison against the reported magnitude, if any
+    # ML estimates succeeded
+    ml_estimates = [r["estimated_ml"] for r in results if r.get("estimated_ml") is not None]
+    if ml_estimates:
+        avg_ml = sum(ml_estimates) / len(ml_estimates)
+        if reported_magnitude is not None:
+            diff = avg_ml - reported_magnitude
+            print(f"  [stations] Independent ML cross-check (avg of "
+                  f"{len(ml_estimates)} station(s)): {avg_ml:.2f} vs. "
+                  f"reported M{reported_magnitude} (difference: "
+                  f"{diff:+.2f}). NOTE: uses a generic Southern-"
+                  f"California-calibrated formula (Hutton & Boore 1987), "
+                  f"not locally calibrated for this region -- treat as "
+                  f"a rough illustrative cross-check only.")
+        else:
+            print(f"  [stations] Independent ML cross-check (avg of "
+                  f"{len(ml_estimates)} station(s)): {avg_ml:.2f}. NOTE: "
+                  f"uses a generic Southern-California-calibrated "
+                  f"formula (Hutton & Boore 1987), not locally "
+                  f"calibrated for this region -- treat as a rough "
+                  f"illustrative cross-check only.")
+
+    return results, had_retryable_failure
+
+
+def _estimate_local_magnitude(raw_trace, inventory, distance_km):
+    """
+    Compute a rough independent local magnitude (ML) estimate from a
+    single station's real waveform, via the classic approach:
+      1. Remove the real instrument response to get true ground
+         displacement (not the acceleration used for PGA).
+      2. Simulate what a classic Wood-Anderson torsion seismometer would
+         have recorded, given that same true ground motion (the
+         standard historical reference instrument ML was originally
+         defined against).
+      3. Measure the peak amplitude (mm) on that simulated trace.
+      4. Apply the Hutton & Boore (1987) magnitude-distance formula.
+
+    HONEST CAVEAT: Hutton & Boore (1987) is calibrated specifically for
+    Southern California -- it is NOT locally calibrated for whatever
+    region this event actually occurred in (mirroring the same
+    region-calibration caveat already applied to GMPE selection
+    elsewhere in this project). Treat the result as a rough illustrative
+    cross-check against the reported magnitude, not a scientifically
+    rigorous independent determination. This function has not been
+    test-executed against a live signal in this environment.
+
+    Returns a single ML float, or raises on failure (caller handles
+    exceptions).
+    """
+    tr_disp = raw_trace.copy()
+    tr_disp.detrend("demean")
+    tr_disp.remove_response(inventory=inventory, output="DISP")  # true ground displacement, meters
+
+    # Classic Wood-Anderson torsion seismometer response (standard
+    # reference values used throughout seismology for ML calculations)
+    paz_wood_anderson = {
+        "poles": [-6.283185 + 4.712389j, -6.283185 - 4.712389j],
+        "zeros": [0j, 0j],
+        "gain": 1.0,
+        "sensitivity": 2800,
+    }
+    tr_disp.simulate(paz_simulate=paz_wood_anderson)
+
+    amplitude_mm = float(np.max(np.abs(tr_disp.data))) * 1000  # meters -> mm
+    if amplitude_mm <= 0:
+        raise ValueError("Simulated Wood-Anderson amplitude is zero or "
+                        "negative -- cannot compute log10")
+
+    # Hutton & Boore (1987), Southern California -- see caveat above
+    ml = (math.log10(amplitude_mm) + 1.110 * math.log10(distance_km)
+         + 0.00189 * distance_km - 2.09)
+    return ml
 
 
 def merge_station_data_into_grid(pga_grid, lats, lons, gmpe, magnitude,
@@ -572,6 +665,11 @@ def merge_station_data_into_grid(pga_grid, lats, lons, gmpe, magnitude,
             ctx.rake = 0.0
             ctx.dip = 90.0
             ctx.ztor = depth_km
+            ctx.hypo_depth = depth_km  # required by some GMPE families
+                                       # (e.g. subduction interface models
+                                       # like ZhaoEtAl2006SInter) that
+                                       # weren't needed by the shallow
+                                       # crustal models tested earlier
             ctx.rjb = np.array([dist_km], dtype=float)
             ctx.rrup = np.array([dist_km], dtype=float)
             ctx.vs30 = np.array([station_vs30], dtype=float)
@@ -766,6 +864,24 @@ def init_history_db():
             FOREIGN KEY(event_id) REFERENCES events(id)
         )
     """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pending_station_retries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER,
+            event_time REAL,
+            event_lat REAL,
+            event_lon REAL,
+            event_mag REAL,
+            event_depth REAL,
+            event_place TEXT,
+            retry_after REAL,
+            attempt_count INTEGER DEFAULT 0,
+            created_at REAL,
+            FOREIGN KEY(event_id) REFERENCES events(id)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -829,6 +945,191 @@ def log_shaking_estimate_to_db(event_id, region_name, tectonic_type,
         conn.close()
     except Exception as e:
         print(f"  [history] Failed to log shaking estimate: {type(e).__name__}: {e}")
+
+
+# ============================================================================
+# Station data retry queue (see STATION_RETRY_ENABLED in config.py)
+# ============================================================================
+
+def _is_retry_worthy_error(error_message):
+    """
+    Classify a station-fetch failure as either "might just be too soon,
+    worth retrying later" or "permanent, retrying won't help" -- based
+    on the specific error text.
+
+    HEURISTIC, not a certainty: this is a best-effort classification
+    based on patterns observed in real error messages during this
+    project's development, not a guaranteed-correct distinction. Errors
+    explicitly mentioning the station's operating dates don't cover the
+    requested time ("out of bounds of valid station epochs") are treated
+    as permanent, since that reflects the station's real operating
+    history, not data-ingestion timing. Generic "no data" responses are
+    treated as retry-worthy, since we've directly observed this pattern
+    with archive-latency issues elsewhere in this project (e.g. the
+    Vs30 service, FDSN dataselect for very recent events).
+    """
+    msg_lower = str(error_message).lower()
+    permanent_patterns = [
+        "out of bounds of valid station epochs",
+        "station not found",
+        "unauthorized",
+        "forbidden",
+    ]
+    return not any(p in msg_lower for p in permanent_patterns)
+
+
+def queue_station_retry(event):
+    """Queue an event for an automatic station-data retry later, if
+    STATION_RETRY_ENABLED. Safe to call even if event['_db_id'] is None
+    (won't be able to link back to the events table, but the retry
+    attempt itself will still work)."""
+    if not STATION_RETRY_ENABLED:
+        return
+    try:
+        conn = sqlite3.connect(HISTORY_DB_PATH)
+        retry_after = time.time() + STATION_RETRY_DELAY_MINUTES * 60
+        conn.execute("""
+            INSERT INTO pending_station_retries
+                (event_id, event_time, event_lat, event_lon, event_mag,
+                event_depth, event_place, retry_after, attempt_count, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+        """, (event.get("_db_id"), event["time"], event["lat"], event["lon"],
+             event["mag"], event.get("depth"), event["place"],
+             retry_after, time.time()))
+        conn.commit()
+        conn.close()
+        print(f"      Queued for a station-data retry in "
+              f"{STATION_RETRY_DELAY_MINUTES:.0f} minutes.")
+    except Exception as e:
+        print(f"  [retry] Failed to queue retry: {type(e).__name__}: {e}")
+
+
+def process_pending_retries():
+    """
+    Check for any due station-data retries and attempt them. Called
+    periodically from a background thread (see run_retry_checker_loop).
+    On success, regenerates that event's shake maps (including the
+    merged map, if it can now be generated) and updates the database.
+    On failure, either reschedules for another attempt or gives up after
+    STATION_RETRY_MAX_ATTEMPTS.
+    """
+    try:
+        conn = sqlite3.connect(HISTORY_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        due = conn.execute("""
+            SELECT * FROM pending_station_retries
+            WHERE retry_after <= ? AND attempt_count < ?
+        """, (time.time(), STATION_RETRY_MAX_ATTEMPTS)).fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"  [retry] Failed to check pending retries: {type(e).__name__}: {e}")
+        return
+
+    if not due:
+        return
+
+    print(f"\n  [retry] {len(due)} pending station-data retry(ies) due, "
+          f"attempting now...")
+
+    for row in due:
+        event = {
+            "_db_id": row["event_id"],
+            "time": row["event_time"],
+            "lat": row["event_lat"],
+            "lon": row["event_lon"],
+            "mag": row["event_mag"],
+            "depth": row["event_depth"],
+            "place": row["event_place"],
+        }
+        attempt_num = row["attempt_count"] + 1
+        print(f"  [retry] Attempt {attempt_num}/{STATION_RETRY_MAX_ATTEMPTS} "
+              f"for M{event['mag']} {event['place']}...")
+
+        station_data = []
+        had_retryable_failure = True
+        try:
+            station_data, had_retryable_failure = find_and_measure_nearby_stations(
+                event["lat"], event["lon"], event["time"],
+                reported_magnitude=event.get("mag"))
+        except Exception as e:
+            print(f"  [retry] Retry attempt failed: {type(e).__name__}: {e}")
+
+        if station_data:
+            # Success! Regenerate this event's shake maps (now including
+            # the merged map, since real station data finally exists)
+            # and update the database.
+            print(f"  [retry] SUCCESS -- got real station data on retry. "
+                  f"Regenerating shake maps...")
+            try:
+                results, out_of_range, (region_name, tectonic_type,
+                                       gmpe_name, caution_note) = \
+                    compute_shaking_at_targets(event["mag"],
+                                              event.get("depth", 10.0),
+                                              event["lat"], event["lon"])
+                map_paths = generate_all_shakemaps(
+                    event, results, out_of_range, station_data=station_data)
+                log_shaking_estimate_to_db(
+                    event["_db_id"], region_name, tectonic_type, gmpe_name,
+                    caution_note, results, map_paths=map_paths)
+                for label, path in map_paths.items():
+                    if path:
+                        print(f"  [retry] Updated shake map ({label}): {path}")
+            except Exception as e:
+                print(f"  [retry] Got station data but failed to "
+                      f"regenerate maps: {type(e).__name__}: {e}")
+
+            _remove_pending_retry(row["id"])
+
+        elif not had_retryable_failure:
+            # All failures were permanent this time -- no point trying again
+            print(f"  [retry] All failures were permanent (not just "
+                  f"latency) -- giving up on this event.")
+            _remove_pending_retry(row["id"])
+
+        elif attempt_num >= STATION_RETRY_MAX_ATTEMPTS:
+            print(f"  [retry] Reached max attempts ({STATION_RETRY_MAX_ATTEMPTS}) "
+                  f"-- giving up on this event.")
+            _remove_pending_retry(row["id"])
+
+        else:
+            # Still no luck, but retry-worthy -- reschedule
+            _reschedule_pending_retry(row["id"], attempt_num)
+            print(f"  [retry] Still no data -- rescheduled for another "
+                  f"attempt in {STATION_RETRY_DELAY_MINUTES:.0f} minutes.")
+
+
+def _remove_pending_retry(retry_id):
+    try:
+        conn = sqlite3.connect(HISTORY_DB_PATH)
+        conn.execute("DELETE FROM pending_station_retries WHERE id=?", (retry_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"  [retry] Failed to remove retry record: {type(e).__name__}: {e}")
+
+
+def _reschedule_pending_retry(retry_id, new_attempt_count):
+    try:
+        conn = sqlite3.connect(HISTORY_DB_PATH)
+        new_retry_after = time.time() + STATION_RETRY_DELAY_MINUTES * 60
+        conn.execute("""
+            UPDATE pending_station_retries
+            SET attempt_count=?, retry_after=?
+            WHERE id=?
+        """, (new_attempt_count, new_retry_after, retry_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"  [retry] Failed to reschedule retry: {type(e).__name__}: {e}")
+
+
+def run_retry_checker_loop():
+    """Background thread: periodically checks for and processes due
+    station-data retries."""
+    while True:
+        time.sleep(STATION_RETRY_CHECK_INTERVAL_SEC)
+        if STATION_RETRY_ENABLED:
+            process_pending_retries()
 
 
 _lock = threading.Lock()
@@ -930,6 +1231,9 @@ def compute_shaking_at_targets(magnitude, depth_km, event_lat, event_lon):
     ctx.rake = 0.0
     ctx.dip = 90.0
     ctx.ztor = depth_km
+    ctx.hypo_depth = depth_km  # required by some GMPE families (e.g.
+                               # subduction interface models) not needed
+                               # by the shallow crustal models tested earlier
     ctx.rjb = np.array(distances, dtype=float)
     ctx.rrup = np.array(distances, dtype=float)
     ctx.vs30 = np.array(vs30_values, dtype=float)
@@ -1079,6 +1383,13 @@ def generate_shakemap_plot(event, in_range_results, out_of_range_results,
         ctx.rake = 0.0
         ctx.dip = 90.0
         ctx.ztor = depth_km
+        ctx.hypo_depth = depth_km  # required by some GMPE families (e.g.
+                                   # subduction interface models like
+                                   # ZhaoEtAl2006SInter) -- this exact
+                                   # spot is what first surfaced the real
+                                   # AttributeError, since the map grid
+                                   # always computes regardless of
+                                   # whether any targets are in range
         ctx.rjb = np.array(row_dists, dtype=float)
         ctx.rrup = np.array(row_dists, dtype=float)
         ctx.vs30 = vs30_grid[i, :].astype(float)
@@ -1369,12 +1680,15 @@ def print_shaking_estimate(event):
 
     station_data = []
     try:
-        station_data = find_and_measure_nearby_stations(
-            event["lat"], event["lon"], event["time"])
+        station_data, had_retryable_failure = find_and_measure_nearby_stations(
+            event["lat"], event["lon"], event["time"],
+            reported_magnitude=event.get("mag"))
         if not station_data:
             print(f"      No real station data available near this event "
                   f"(this is common -- station coverage is genuinely "
                   f"sparse in most regions).")
+            if had_retryable_failure:
+                queue_station_retry(event)
     except Exception as e:
         print(f"      Real station search failed: {type(e).__name__}: {e}")
 
@@ -1702,6 +2016,12 @@ def main():
 
     emsc_thread = threading.Thread(target=run_emsc_listener, daemon=True)
     emsc_thread.start()
+
+    if STATION_RETRY_ENABLED:
+        retry_thread = threading.Thread(target=run_retry_checker_loop, daemon=True)
+        retry_thread.start()
+        print(f"Station-data retry checker running (checks every "
+              f"{STATION_RETRY_CHECK_INTERVAL_SEC // 60} min)\n")
 
     try:
         run_usgs_poller()
