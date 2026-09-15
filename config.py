@@ -279,6 +279,18 @@ REGION_GMPE_TABLE = [
      "Subduction Interface",
      "openquake.hazardlib.gsim.zhao_2006", "ZhaoEtAl2006SInter", None),
 
+    # Same Pacific island-arc subduction setting as Tonga/Kermadec above,
+    # just on the other side of the antimeridian (positive longitude) --
+    # covers Vanuatu, New Caledonia, and the Loyalty Islands (New
+    # Hebrides Trench). Added after a real Loyalty Islands event fell
+    # through to the generic fallback, since this specific gap between
+    # the Tonga box (up to -170) and this region was never actually
+    # closed despite the antimeridian-splitting approach being intended
+    # from the start.
+    ("Vanuatu / New Caledonia (subduction)", -25, -10, 160, 175,
+     "Subduction Interface",
+     "openquake.hazardlib.gsim.zhao_2006", "ZhaoEtAl2006SInter", None),
+
     ("Japan (subduction)", 24, 46, 122, 148,
      "Subduction Interface",
      "openquake.hazardlib.gsim.zhao_2006", "ZhaoEtAl2006SInter", None),

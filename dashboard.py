@@ -104,6 +104,7 @@ INDEX_TEMPLATE = """
         .mag-badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
                     color: white; font-weight: 600; font-size: 0.85em; }
         .caution { color: #b45309; font-size: 0.85em; }
+        .below-threshold { color: #aaa; font-size: 0.85em; font-style: italic; }
         .test-badge { display: inline-block; padding: 1px 6px; border-radius: 8px;
                      background: #ddd; color: #555; font-size: 0.75em; margin-left: 6px; }
     </style>
@@ -151,7 +152,13 @@ INDEX_TEMPLATE = """
             <td><span class="mag-badge" style="background:{{ mag_color(ev.mag) }}">M{{ ev.mag }}</span></td>
             <td>{{ ev.place }}{% if 'TEST' in (ev.sources or '') %}<span class="test-badge">TEST</span>{% endif %}</td>
             <td>{{ ev.time_str }}</td>
-            <td>{{ ev.region_name or '-' }}{% if ev.caution_note %} <span class="caution">⚠</span>{% endif %}</td>
+            <td>
+                {% if ev.region_name %}
+                    {{ ev.region_name }}{% if ev.caution_note %} <span class="caution">⚠</span>{% endif %}
+                {% else %}
+                    <span class="below-threshold">{{ ev.region_display }}</span>
+                {% endif %}
+            </td>
         </tr>
         {% endfor %}
     </table>
@@ -287,6 +294,16 @@ def index():
         d = dict(row)
         d["time_str"] = datetime.fromtimestamp(
             d["event_time"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        # Region/GMPE only get computed for events meeting
+        # SHAKING_MAGNITUDE_THRESHOLD (see earthquake_monitor_with_shaking.py) --
+        # make that explicit here instead of showing an unexplained blank.
+        if d["region_name"]:
+            d["region_display"] = d["region_name"]
+        elif d["mag"] is not None and d["mag"] < config.SHAKING_MAGNITUDE_THRESHOLD:
+            d["region_display"] = (f"(below M{config.SHAKING_MAGNITUDE_THRESHOLD:g} "
+                                  f"threshold -- no shaking estimate run)")
+        else:
+            d["region_display"] = "-"
         events.append(d)
 
     # Build the Folium map

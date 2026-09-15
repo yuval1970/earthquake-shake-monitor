@@ -40,6 +40,7 @@ Edit SHAKING_MAGNITUDE_THRESHOLD and TARGET_LOCATIONS below to configure.
 """
 
 import json
+import traceback
 import sqlite3
 import smtplib
 from email.mime.text import MIMEText
@@ -679,7 +680,10 @@ def merge_station_data_into_grid(pga_grid, lats, lons, gmpe, magnitude,
             station_vs30 = lookup_vs30(sd["lat"], sd["lon"])
 
             ctx = RuptureContext()
-            ctx.mag = magnitude
+            ctx.mag = np.array([magnitude], dtype=float)  # array, not scalar --
+                                       # some GMPEs (e.g. AtkinsonBoore2006)
+                                       # index mag internally (mag[idxs]),
+                                       # which fails on a plain float
             ctx.rake = 0.0
             ctx.dip = 90.0
             ctx.ztor = depth_km
@@ -1095,6 +1099,7 @@ def process_pending_retries():
             except Exception as e:
                 print(f"  [retry] Got station data but failed to "
                       f"regenerate maps: {type(e).__name__}: {e}")
+                print(f"  [retry] Full traceback for debugging:\n{traceback.format_exc()}")
 
             _remove_pending_retry(row["id"])
 
@@ -1245,7 +1250,10 @@ def compute_shaking_at_targets(magnitude, depth_km, event_lat, event_lon):
     n = len(distances)
 
     ctx = RuptureContext()
-    ctx.mag = magnitude
+    ctx.mag = np.full(n, magnitude, dtype=float)  # array, not scalar --
+                               # some GMPEs (e.g. AtkinsonBoore2006) index
+                               # mag internally (mag[idxs]), which fails
+                               # on a plain float
     ctx.rake = 0.0
     ctx.dip = 90.0
     ctx.ztor = depth_km
@@ -1397,7 +1405,11 @@ def generate_shakemap_plot(event, in_range_results, out_of_range_results,
     for i, la in enumerate(lats):
         row_dists = [haversine_km(event_lat, event_lon, la, lo) for lo in lons]
         ctx = RuptureContext()
-        ctx.mag = magnitude
+        ctx.mag = np.full(grid_n, magnitude, dtype=float)  # array, not
+                                   # scalar -- confirmed via a real
+                                   # traceback that AtkinsonBoore2006's
+                                   # internal implementation does
+                                   # mag[idxs], which fails on a plain float
         ctx.rake = 0.0
         ctx.dip = 90.0
         ctx.ztor = depth_km
@@ -1719,6 +1731,7 @@ def print_shaking_estimate(event):
                 print(f"      Shake map ({label}) saved: {path}")
     except Exception as e:
         print(f"      Shake map generation failed: {type(e).__name__}: {e}")
+        print(f"      Full traceback for debugging:\n{traceback.format_exc()}")
 
     log_shaking_estimate_to_db(event.get("_db_id"), region_name,
                               tectonic_type, gmpe_name, caution_note, results,
